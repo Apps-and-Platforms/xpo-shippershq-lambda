@@ -22,36 +22,10 @@ MAX_RETRIES = 3
 
 SHQ_API_BASE_DEFAULT = "https://ovs.shipperhq.com"
 
-WWEX_SHQ_CARRIER_CODE = "shqworldwideexpress"
-
-# ShipperHQ methodCode -> (UPS numeric service code, method name) for the WWEX carrier.
-WWEX_UPS_METHODS = {
-    "70": ("70", "UPS Access Point Economy"),
-    "2DA": ("02", "UPS 2nd Day Air"),
-    "2DM": ("59", "UPS 2nd Day Air A.M."),
-    "3DS": ("12", "UPS 3 Day Select"),
-    "GND": ("03", "UPS Ground"),
-    "1DA": ("01", "UPS Next Day Air"),
-    "1DM": ("14", "UPS Next Day Air Early"),
-    "1DP": ("13", "UPS Next Day Air Saver"),
-    "STD": ("11", "UPS Standard"),
-    "83": ("83", "UPS Today Dedicated Courier"),
-    "85": ("85", "UPS Today Express"),
-    "86": ("86", "UPS Today Express Saver"),
-    "82": ("82", "UPS Today Standard"),
-    "WEDP": ("72", "UPS Worldwide Economy DDP"),
-    "WEDU": ("17", "UPS Worldwide Economy DDU"),
-    "XPD": ("08", "UPS Worldwide Expedited"),
-    "XPR": ("07", "UPS Worldwide Express"),
-    "96": ("96", "UPS Worldwide Express Freight"),
-    "XDM": ("54", "UPS Worldwide Express Plus"),
-    "65": ("65", "UPS Worldwide Saver"),
-}
-
-# ShipperHQ carrierCode -> (WWEX carrier, methodCode table). To support another carrier,
-# add a methods table like WWEX_UPS_METHODS above and register it here. Matched exactly.
+# ShipperHQ carrierCode -> carrier reported to Pipe17. Matched exactly; unlisted carriers are not synced.
 WWEX_CARRIER_MAP = {
-    WWEX_SHQ_CARRIER_CODE: ("UPS", WWEX_UPS_METHODS),
+    "shqworldwideexpress": "UPS",
+    "shqworldwideexpressfreight": "LTL",
 }
 
 ADVANCED_SHIPMENT_QUERY = """
@@ -265,20 +239,16 @@ def get_carrier_code(shipment: dict):
 
 def map_to_wwex(carrier_code, method_code):
     """Return (wwex_carrier, wwex_carrier_code) for a ShipperHQ carrier/method, or (None, None) if unmapped."""
-    carrier_mapping = WWEX_CARRIER_MAP.get(carrier_code)
-    if carrier_mapping is None:
+    wwex_carrier = WWEX_CARRIER_MAP.get(carrier_code)
+    if wwex_carrier is None:
         log.warning(f"No WWEX mapping for carrierCode='{carrier_code}' (known: {list(WWEX_CARRIER_MAP)})")
         return None, None
-
-    wwex_carrier, methods = carrier_mapping
-    method = methods.get(method_code)
-    if method is None:
-        log.warning(f"No WWEX mapping for carrierCode='{carrier_code}' methodCode='{method_code}'")
+    if not method_code:
+        log.warning(f"No methodCode for carrierCode='{carrier_code}'")
         return None, None
 
-    numeric_code, _name = method
     log.debug(
         f"Mapped ShipperHQ carrierCode='{carrier_code}' methodCode='{method_code}' "
-        f"-> WWEX carrier='{wwex_carrier}' code='{numeric_code}' ({_name})"
+        f"-> WWEX carrier='{wwex_carrier}' code='{method_code}'"
     )
-    return wwex_carrier, numeric_code
+    return wwex_carrier, method_code

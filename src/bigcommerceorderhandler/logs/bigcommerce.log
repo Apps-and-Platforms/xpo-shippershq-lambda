@@ -1,0 +1,2 @@
+2026-10-08 12:18:53 | WARNING  | shipperhq | shipperhq.py:map_to_wwex:296 | No WWEX mapping for carrierCode='shqworldwideexpress' methodCode='XYZ'
+2026-10-08 12:21:02 | WARNING  | shipperhq | shipperhq.py:map_to_wwex:242 | No WWEX mapping for carrierCode='other' (expected 'shqworldwideexpress')

@@ -7,6 +7,7 @@ Credentials are read from environment variables (see .env.example):
 
 import os
 import time
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -188,17 +189,21 @@ class Pipe17Client:
         return matches
 
     def update_order_custom_fields(self, order_id, carrier, carrier_code):
-        """Set the "Carrier" and "Code" custom fields on the Pipe17 order with internal id `order_id`.
+        """Set the "Carrier", "Code" and "Timestamp" custom fields on the Pipe17 order with internal id `order_id`.
 
         Returns True if Pipe17 reports the update succeeded, False otherwise.
         """
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         body = {
             "customFields": [
                 {"name": "Carrier", "value": carrier},
                 {"name": "Code", "value": carrier_code},
-            ]
+                {"name": "Timestamp", "value": timestamp},
+                {"name": "Modified_By", "value": "AWS_Lambda"},
+            ],
+            "status":"readyForFulfillment"
         }
-        log.info(f"Pipe17 order {order_id} | updating customFields Carrier='{carrier}' Code='{carrier_code}'")
+        log.info(f"Pipe17 order {order_id} | updating customFields Carrier='{carrier}' Code='{carrier_code}' Timestamp='{timestamp}'")
         try:
             payload = self._request(f"orders/{order_id}", method="PUT", json_body=body)
         except requests.exceptions.RequestException as exc:
@@ -208,7 +213,7 @@ class Pipe17Client:
         # An empty body (e.g. 204) means the PUT was accepted; otherwise trust the "success" flag.
         success = payload.get("success", True) is True
         if success:
-            log.info(f"Pipe17 order {order_id} | updated customFields Carrier='{carrier}' Code='{carrier_code}'")
+            log.info(f"Pipe17 order {order_id} | updated customFields Carrier='{carrier}' Code='{carrier_code}' Timestamp='{timestamp}'")
         else:
             log.error(
                 f"Pipe17 order {order_id} | customFields update rejected: "
