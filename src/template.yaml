@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  lambda-bc-orderchange-v1
+
+  Sample SAM Template for lambda-bc-orderchange-v1
+
+Parameters:
+  BrandName:
+    Type: String
+    Description: "Brand name used to prefix resource names (e.g. clubpilates)."
+    AllowedPattern: "^[a-zA-Z0-9-]{1,30}$"
+    ConstraintDescription: "Must be 1-30 characters: letters, numbers and hyphens only."
+  BigCommerceEventBusName:
+    Type: String
+    Description: "Name of the BigCommerce partner event bus (e.g. aws.partner/bigcommerce.com/<store-hash>/<id>)."
+    MinLength: 1
+  SecretAdminPrincipalArn:
+    Type: String
+    Description: "IAM user or role ARN given full access (read, update, delete) to the order sync secret (e.g. arn:aws:iam::<account>:user/<name>). For SSO/assumed roles use the role ARN, not the assumed-role session ARN."
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:(user|role)/.+$"
+    ConstraintDescription: "Must be an IAM user or role ARN."
+  PermissionsBoundaryPolicyName:
+    Type: String
+    Default: shipperhq-lambda-permissions-boundary
+    Description: "Name of the customer managed policy (created by iam/sam-deployer-role.yaml) used as the function role's permissions boundary."
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    PermissionsBoundary: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${PermissionsBoundaryPolicyName}"
+    Tags:
+      Brand: !Ref BrandName
+
+Resources:
+  BigCommerceOrderSyncSecret:
+    Type: AWS::SecretsManager::Secret
+    # Delete (not retain) on rollback, stack deletion or replacement.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Holds BigCommerce, ShipperHQ and Pipe17 credentials read by the order change function via ORDER_SYNC_SECRET_ARN."
+        must:
+          - "SecretString must be a JSON object with non-empty BC_STORE_HASH, BC_ACCESS_TOKEN, PIPE17_API_KEY and SHQ_ACCESS_TOKEN."
+    Properties:
+      Name: !Sub "${BrandName}/shipperhq/bigcommerce-order-sync"
+      Description: !Sub "Order sync credentials for ${BrandName} (keys from .env.example). Fill in values after deploy."
+      SecretString: |
+        {
+          "BC_STORE_HASH": "",
+          "BC_ACCESS_TOKEN": "",
+          "BC_CLIENT_ID": "",
+          "SHQ_ACCESS_TOKEN": "",
+          "SHQ_API_BASE": "https://ovs.shipperhq.com",
+          "PIPE17_API_KEY": "",
+          "PIPE17_API_BASE": "https://api-v3.pipe17.com/api/v3",
+          "LOG_LEVEL": "INFO"
+        }
+      Tags:
+        - Key: Brand
+          Value: !Ref BrandName
+
+  BigCommerceOrderSyncSecretPolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Restricts reading the order sync secret value to the order change function's role and the secret admin, and gives the secret admin full access."
+        must:
+          - "Only BigCommerceOrderChangeFunctionV1Role and SecretAdminPrincipalArn may call secretsmanager:GetSecretValue on BigCommerceOrderSyncSecret."
+          - "SecretAdminPrincipalArn has secretsmanager:* on BigCommerceOrderSyncSecret."
+    Properties:
+      SecretId: !Ref BigCommerceOrderSyncSecret
+      BlockPublicPolicy: true
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyReadExceptFunctionRoleAndSecretAdmin
+            Effect: Deny
+            Principal: "*"
+            Action: secretsmanager:GetSecretValue
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !GetAtt BigCommerceOrderChangeFunctionV1Role.Arn
+                  - !Ref SecretAdminPrincipalArn
+          - Sid: AllowFullAccessBySecretAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Ref SecretAdminPrincipalArn
+            Action: secretsmanager:*
+            Resource: "*"
+
+  BigCommerceOrderChangeFunctionV1:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Processes BigCommerce order change events for the shipping workflow."
+        trust:
+          src: infer
+          conf: low
+          note: "rationale not documented"
+    Properties:
+      FunctionName: !Sub "${BrandName}-bigcommerce-order-change-v1"
+      CodeUri: bigcommerceorderhandler/
+      Handler: app.lambda_handler
+      Runtime: python3.14
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          BRAND_NAME: !Ref BrandName
+          ORDER_SYNC_SECRET_ARN: !Ref BigCommerceOrderSyncSecret
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref BigCommerceOrderSyncSecret
+
+  BigCommerceOrderChangeRule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Forwards every event on the BigCommerce partner event bus to the order change function."
+        trust:
+          src: infer
+          conf: low
+          note: "rationale not documented"
+    Properties:
+      Name: !Sub "${BrandName}-bigcommerce-order-change-all"
+      Description: !Sub "Forwards all ${BrandName} BigCommerce events to the order change function."
+      EventBusName: !Ref BigCommerceEventBusName
+      State: ENABLED
+      # Empty prefix matches every event on the bus, forwarding all messages to the function.
+      EventPattern:
+        source:
+          - prefix: ""
+      Targets:
+        - Id: BigCommerceOrderChangeFunctionV1
+          Arn: !GetAtt BigCommerceOrderChangeFunctionV1.Arn
+
+  BigCommerceOrderChangeRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BigCommerceOrderChangeFunctionV1
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BigCommerceOrderChangeRule.Arn
+
+Outputs:
+  BigCommerceOrderChangeFunctionV1:
+    Description: "BigCommerce order change Lambda Function ARN"
+    Value: !GetAtt BigCommerceOrderChangeFunctionV1.Arn
+    Export:
+      Name: !Sub "${BrandName}-BigCommerceOrderChangeFunctionV1Arn"
+  BigCommerceOrderChangeFunctionV1IamRole:
+    Description: "Implicit IAM Role created for the BigCommerce order change function"
+    Value: !GetAtt BigCommerceOrderChangeFunctionV1Role.Arn
+    Export:
+      Name: !Sub "${BrandName}-BigCommerceOrderChangeFunctionV1RoleArn"
+  BigCommerceOrderChangeRuleArn:
+    Description: "EventBridge rule forwarding BigCommerce events to the order change function"
+    Value: !GetAtt BigCommerceOrderChangeRule.Arn
+    Export:
+      Name: !Sub "${BrandName}-BigCommerceOrderChangeRuleArn"
+  BigCommerceOrderSyncSecretArn:
+    Description: "Secrets Manager secret holding order sync credentials"
+    Value: !Ref BigCommerceOrderSyncSecret
+    Export:
+      Name: !Sub "${BrandName}-BigCommerceOrderSyncSecretArn"

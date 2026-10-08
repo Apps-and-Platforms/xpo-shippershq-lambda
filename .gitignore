@@ -1,0 +1,15 @@
+.vscode/
+src/credentials/
+
+
+
+
+src/__init__.py
+src/.aws-sam/
+
+src/bigcommerceorderhandler/__init__.py
+src/tests/integration/__init__.py
+.DS_Store
+src/tests
+src/__pycache__/
+src/events/

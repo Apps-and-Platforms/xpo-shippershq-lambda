@@ -1,0 +1,35 @@
+# More information about the configuration file can be found here:
+# # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
+version = 0.1
+
+[default.global.parameters]
+stack_name = "lambda-bc-changeorder-stack"
+region = "us-east-2"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+stack_name = "clubpilates-shipperhq"
+s3_prefix = "clubpilates-shipperhq"
+parameter_overrides = "BrandName=\"clubpilates\" BigCommerceEventBusName=\"aws.partner/bigcommerce.com/36q3qe30nogzkwdzde4tez8c8vvp5im/BigCommerce_YogaSix_Sandbox_EventBridge\" SecretAdminPrincipalArn=\"arn:aws:iam::020871906410:user/franconnect-s3-user\""
+image_repositories = []
+
+[default.package.parameters]
+resolve_s3 = true
+
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.local_start_lambda.parameters]
+warm_containers = "EAGER"
