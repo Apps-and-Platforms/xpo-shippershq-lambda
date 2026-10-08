@@ -1,13 +1,26 @@
-"""Reusable application logger with console + rotating file output."""
+"""Reusable application logger: stdout (captured by CloudWatch on Lambda) + rotating file when run locally."""
 
 import logging
 import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# Lambda forwards everything written to stdout/stderr to the function's CloudWatch log group.
+RUNNING_IN_LAMBDA = bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+class _RequestIdFilter(logging.Filter):
+    """Ensure every record has `aws_request_id` (set by the Lambda runtime; "-" when run locally)."""
+
+    def filter(self, record):
+        if not hasattr(record, "aws_request_id"):
+            record.aws_request_id = "-"
+        return True
+
 
 class AppLogger:
-    """Wraps `logging.Logger` with sane defaults (console + rotating file, one-time setup per name)."""
+    """Wraps `logging.Logger` with sane defaults (stdout + local rotating file, one-time setup per name)."""
 
     _configured_names = set()
 
@@ -29,24 +42,32 @@ class AppLogger:
         if name not in AppLogger._configured_names:
             self.logger.propagate = False
             formatter = logging.Formatter(
-                fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(funcName)s:%(lineno)d | %(message)s",
+                fmt="%(asctime)s | %(levelname)-8s | %(aws_request_id)s | %(name)s | "
+                "%(filename)s:%(funcName)s:%(lineno)d | %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
+            request_id_filter = _RequestIdFilter()
 
-            console_handler = logging.StreamHandler()
+            # stdout is what CloudWatch picks up in Lambda; it's also the console when run locally.
+            console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setFormatter(formatter)
+            console_handler.addFilter(request_id_filter)
             self.logger.addHandler(console_handler)
 
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
-                Path(log_dir) / log_file, maxBytes=max_bytes, backupCount=backup_count
-            )
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
+            # Lambda's filesystem is ephemeral (only /tmp is writable), so a log file there would never
+            # be seen; skip it and rely on CloudWatch. Locally, keep the rotating file.
+            log_path = None
+            if not RUNNING_IN_LAMBDA:
+                log_path = Path(log_dir) / log_file
+                Path(log_dir).mkdir(parents=True, exist_ok=True)
+                file_handler = RotatingFileHandler(log_path, maxBytes=max_bytes, backupCount=backup_count)
+                file_handler.setFormatter(formatter)
+                file_handler.addFilter(request_id_filter)
+                self.logger.addHandler(file_handler)
 
             AppLogger._configured_names.add(name)
             self.logger.debug(
-                f"Logger '{name}' configured: level={level}, file={Path(log_dir) / log_file}, "
+                f"Logger '{name}' configured: level={level}, file={log_path or 'disabled (CloudWatch only)'}, "
                 f"max_bytes={max_bytes}, backup_count={backup_count}"
             )
 

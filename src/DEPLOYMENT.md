@@ -100,7 +100,7 @@ sam deploy \
       PermissionsBoundaryPolicyName=shipperhq-lambda-permissions-boundary
 ```
 
-[`samconfig.toml`](samconfig.toml) already contains everything except `--profile`, so `sam deploy --profile shipperhq-deployer` alone is equivalent.
+[`samconfig.toml`](samconfig.toml) already contains everything, including `profile = "shipperhq-deployer"`, so `sam deploy` alone is equivalent.
 
 | Argument | Meaning |
 |---|---|
@@ -161,3 +161,4 @@ aws cloudformation delete-stack --stack-name shipperhq-sam-deployer-role --regio
 - **`AccessDenied` on `iam:CreateRole` or `PutRolePolicy`:** the boundary name in `template.yaml` doesn't match the one in the deployer stack, or the stack name doesn't match `*-shipperhq`.
 - **The function gets AccessDenied at runtime:** it needs something the boundary doesn't allow. Add that permission to the boundary policy in `iam/sam-deployer-role.yaml` and redeploy step 1.
 - **The secret name already exists:** an earlier secret is still pending deletion. Run the force-delete command from the teardown section.
+- **`AccessDenied` on `s3:PutObject` naming `user/franconnect-s3-user`:** `sam deploy` ran as your user rather than the deployer role. Check that the `shipperhq-deployer` profile from step 2 exists and that `aws sts get-caller-identity --profile shipperhq-deployer` shows the assumed role.

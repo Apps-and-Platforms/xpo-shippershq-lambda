@@ -14,6 +14,7 @@ parallel = true
 lint = true
 
 [default.deploy.parameters]
+profile = "shipperhq-deployer"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 resolve_s3 = true
@@ -23,6 +24,7 @@ parameter_overrides = "BrandName=\"clubpilates\" BigCommerceEventBusName=\"aws.p
 image_repositories = []
 
 [default.package.parameters]
+profile = "shipperhq-deployer"
 resolve_s3 = true
 
 [default.sync.parameters]
