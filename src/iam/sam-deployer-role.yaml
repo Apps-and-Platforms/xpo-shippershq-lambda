@@ -7,7 +7,7 @@ Description: >
 
     aws cloudformation deploy --template-file iam/sam-deployer-role.yaml \
       --stack-name shipperhq-sam-deployer-role --capabilities CAPABILITY_NAMED_IAM \
-      --parameter-overrides TrustedPrincipalArns=arn:aws:iam::<account>:user/<name>
+      --parameter-overrides TrustedPrincipalArns=arn:aws:iam::<account>:user/<name> DeployerUserNames=<name>
 
 Parameters:
   RoleName:
@@ -17,6 +17,10 @@ Parameters:
   TrustedPrincipalArns:
     Type: CommaDelimitedList
     Description: "IAM user/role ARNs allowed to assume the deployer role (e.g. arn:aws:iam::<account>:user/<name>)."
+  DeployerUserNames:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: "IAM user names (not ARNs) to attach a policy allowing sts:AssumeRole on the deployer role. Leave empty to attach none."
   StackNamePattern:
     Type: String
     Default: "*-shipperhq"
@@ -30,7 +34,26 @@ Parameters:
     Default: shipperhq-lambda-permissions-boundary
     Description: "Name of the permissions boundary policy every function role must carry. Must match PermissionsBoundaryPolicyName in ../template.yaml."
 
+Conditions:
+  HasDeployerUsers: !Not [!Equals [!Join ["", !Ref DeployerUserNames], ""]]
+
 Resources:
+  # Lets the deployer users call sts:AssumeRole on the deployer role from their own identity policy.
+  DeployerUserAssumeRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: HasDeployerUsers
+    Properties:
+      ManagedPolicyName: !Sub "${RoleName}-assume-role"
+      Description: "Allows assuming the ShipperHQ SAM deployer role."
+      Users: !Ref DeployerUserNames
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AssumeSamDeployerRole
+            Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt SamDeployerRole.Arn
+
   # Caps what the SAM-generated function role can ever do, whatever inline policy is put on it.
   FunctionPermissionsBoundary:
     Type: AWS::IAM::ManagedPolicy
@@ -55,6 +78,17 @@ Resources:
               - secretsmanager:GetSecretValue
               - secretsmanager:DescribeSecret
             Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${BrandNamePattern}/shipperhq/bigcommerce-order-sync-*"
+          # Caps the AWSLambdaSQSQueueExecutionRole policy SAM attaches for the function's SQS event source.
+          - Sid: OrderChangeQueuePoll
+            Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:DeleteMessageBatch
+              - sqs:ChangeMessageVisibility
+              - sqs:ChangeMessageVisibilityBatch
+              - sqs:GetQueueAttributes
+            Resource: !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${BrandNamePattern}-bigcommerce-order-change"
 
   SamDeployerRole:
     Type: AWS::IAM::Role
@@ -181,6 +215,45 @@ Resources:
                   - lambda:RemovePermission
                   - lambda:GetPolicy
                 Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BrandNamePattern}-bigcommerce-order-change-v1"
+              # SQS event source mapping that feeds the order change queue to the function.
+              - Sid: LambdaEventSourceMappingCreate
+                Effect: Allow
+                Action: lambda:CreateEventSourceMapping
+                Resource: "*"
+                Condition:
+                  ArnLike:
+                    lambda:FunctionArn: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${BrandNamePattern}-bigcommerce-order-change-v1"
+              - Sid: LambdaEventSourceMappingManage
+                Effect: Allow
+                Action:
+                  - lambda:GetEventSourceMapping
+                  - lambda:UpdateEventSourceMapping
+                  - lambda:DeleteEventSourceMapping
+                  - lambda:ListTags
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:event-source-mapping:*"
+              - Sid: LambdaEventSourceMappingList
+                Effect: Allow
+                Action: lambda:ListEventSourceMappings
+                Resource: "*"
+
+              # ---------------- SQS (order change queue and DLQ) ----------------
+              - Sid: OrderChangeQueues
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:SetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ListQueueTags
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${BrandNamePattern}-bigcommerce-order-change"
+                  - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${BrandNamePattern}-bigcommerce-order-change-dlq"
 
               # ---------------- IAM (function role SAM generates) ----------------
               # SAM names it <stack-name>-BigCommerceOrderChangeFunctio-<suffix>.
@@ -209,7 +282,8 @@ Resources:
                 Condition:
                   StringEquals:
                     iam:PermissionsBoundary: !Ref FunctionPermissionsBoundary
-              - Sid: FunctionRoleAttachBasicExecutionOnly
+              # SAM attaches AWSLambdaSQSQueueExecutionRole for the function's SQS event source.
+              - Sid: FunctionRoleAttachManagedPolicies
                 Effect: Allow
                 Action:
                   - iam:AttachRolePolicy
@@ -217,7 +291,9 @@ Resources:
                 Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackNamePattern}-*"
                 Condition:
                   ArnEquals:
-                    iam:PolicyARN: !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                    iam:PolicyARN:
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole"
                   StringEquals:
                     iam:PermissionsBoundary: !Ref FunctionPermissionsBoundary
               - Sid: FunctionRolePassToLambda

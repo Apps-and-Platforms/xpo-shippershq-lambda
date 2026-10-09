@@ -30,6 +30,7 @@ aws cloudformation deploy \
   --profile <admin-profile> \
   --parameter-overrides \
       TrustedPrincipalArns=arn:aws:iam::020871906410:user/franconnect-s3-user \
+      DeployerUserNames=franconnect-s3-user \
       RoleName=shipperhq-sam-deployer \
       StackNamePattern='*-shipperhq' \
       BrandNamePattern='*' \
@@ -40,12 +41,13 @@ aws cloudformation deploy \
 |---|---|
 | `--capabilities CAPABILITY_NAMED_IAM` | Required because the template creates a role and a policy with fixed names |
 | `TrustedPrincipalArns` | Who may assume the role. To list several, separate them with commas inside quotes: `"arn:...:user/a,arn:...:role/b"` |
+| `DeployerUserNames` | IAM user names (not ARNs), e.g. `franconnect-s3-user`, that get a managed policy named `<RoleName>-assume-role` allowing `sts:AssumeRole` on the deployer role. This is the user-side permission; `TrustedPrincipalArns` is the role-side trust, so list the same users in both. To list several, separate them with commas inside quotes: `"user-a,user-b"`. Optional: leave it out (the default is empty) and no policy is created. Removing a user from the list and redeploying detaches the policy from that user |
 | `RoleName` | Name of the deployer role (the default is shown) |
 | `StackNamePattern` | Application stack names the role may manage. `*-shipperhq` matches `clubpilates-shipperhq` |
 | `BrandNamePattern` | `*` allows every brand. Use e.g. `clubpilates` to limit the role to one brand |
 | `FunctionPermissionsBoundaryName` | Must match `PermissionsBoundaryPolicyName` in `template.yaml` (both default to the same name) |
 
-Only `TrustedPrincipalArns` is required; the others are shown with their default values.
+Only `TrustedPrincipalArns` is required. `DeployerUserNames` is optional and is shown with the deploying user; the others are shown with their default values.
 
 Get the role ARN:
 
@@ -54,16 +56,66 @@ aws cloudformation describe-stacks --stack-name shipperhq-sam-deployer-role --re
   --query "Stacks[0].Outputs" --output table
 ```
 
-## Step 2: Set up a CLI profile that assumes the role
+## Step 2: Set up the CLI profiles
+
+You need two profiles:
+
+- `shipperhq-deploy-profile` holds the access keys of `franconnect-s3-user`. It is used only as the source for assuming the role.
+- `shipperhq-deployer` assumes the deployer role using `shipperhq-deploy-profile`. Every later step uses this one.
+
+### 2a: Create the `shipperhq-deploy-profile` source profile
+
+The profile needs an access key for `franconnect-s3-user`. If you don't have one, an admin creates it. The secret is shown only once, so save it right away:
+
+```bash
+aws iam create-access-key --user-name franconnect-s3-user --profile <admin-profile>
+```
+
+Store the key in the new profile. `aws configure` prompts for the key ID and secret, so they don't end up in your shell history:
+
+```bash
+aws configure --profile shipperhq-deploy-profile
+# AWS Access Key ID:     <AccessKeyId>
+# AWS Secret Access Key: <SecretAccessKey>
+# Default region name:   us-east-2
+# Default output format: json
+chmod 600 ~/.aws/credentials ~/.aws/config
+```
+
+Check that the profile signs in as the user:
+
+```bash
+aws sts get-caller-identity --profile shipperhq-deploy-profile
+# Should show: arn:aws:iam::020871906410:user/franconnect-s3-user
+```
+
+**Permissions the user needs.** The user's own IAM policies don't need to grant anything for this setup:
+
+- The user's ARN must be in `TrustedPrincipalArns` from step 1. That trust policy lets the user call `sts:AssumeRole` on the deployer role. Because the role is in the same account and the trust policy names the user directly, the user needs no `sts:AssumeRole` policy of its own.
+- The user must not have an explicit `Deny` on `sts:AssumeRole`, and if it has a permissions boundary, that boundary must allow `sts:AssumeRole` on `arn:aws:iam::020871906410:role/shipperhq-sam-deployer`.
+- Every deployment permission comes from the deployer role. Don't add CloudFormation, S3, Lambda or IAM permissions to the user.
+
+If your account requires every allowed action to be granted to the user explicitly, pass the user in `DeployerUserNames` in step 1; the stack then attaches a managed policy that allows `sts:AssumeRole` on the deployer role. To do it by hand instead, attach [iam/deployer-user-assume-role-policy.json](iam/deployer-user-assume-role-policy.json). It allows only `sts:AssumeRole` on the deployer role. If the user has a permissions boundary, the boundary must allow the same statement.
+
+```bash
+aws iam put-user-policy --user-name franconnect-s3-user \
+  --policy-name assume-shipperhq-sam-deployer \
+  --policy-document file://iam/deployer-user-assume-role-policy.json \
+  --profile <admin-profile>
+```
+
+### 2b: Create the `shipperhq-deployer` role profile
 
 Add this to `~/.aws/config`:
 
 ```ini
 [profile shipperhq-deployer]
 role_arn       = arn:aws:iam::020871906410:role/shipperhq-sam-deployer
-source_profile = default        # the profile holding franconnect-s3-user's keys
+source_profile = shipperhq-deploy-profile
 region         = us-east-2
 ```
+
+Don't put comments on the same line as a value. The CLI reads them as part of the value.
 
 Check that it works:
 
@@ -72,7 +124,7 @@ aws sts get-caller-identity --profile shipperhq-deployer
 # Should show: arn:aws:sts::020871906410:assumed-role/shipperhq-sam-deployer/...
 ```
 
-The role is in the same account and its trust policy names the user directly, so the user doesn't need an extra `sts:AssumeRole` policy.
+If this returns `AccessDenied` on `sts:AssumeRole`, check that `TrustedPrincipalArns` from step 1 includes `arn:aws:iam::020871906410:user/franconnect-s3-user`, and run `aws sts get-caller-identity --profile shipperhq-deploy-profile` again to confirm the source profile works.
 
 ## Step 3: Build
 
@@ -161,4 +213,4 @@ aws cloudformation delete-stack --stack-name shipperhq-sam-deployer-role --regio
 - **`AccessDenied` on `iam:CreateRole` or `PutRolePolicy`:** the boundary name in `template.yaml` doesn't match the one in the deployer stack, or the stack name doesn't match `*-shipperhq`.
 - **The function gets AccessDenied at runtime:** it needs something the boundary doesn't allow. Add that permission to the boundary policy in `iam/sam-deployer-role.yaml` and redeploy step 1.
 - **The secret name already exists:** an earlier secret is still pending deletion. Run the force-delete command from the teardown section.
-- **`AccessDenied` on `s3:PutObject` naming `user/franconnect-s3-user`:** `sam deploy` ran as your user rather than the deployer role. Check that the `shipperhq-deployer` profile from step 2 exists and that `aws sts get-caller-identity --profile shipperhq-deployer` shows the assumed role.
+- **`AccessDenied` on `s3:PutObject` naming `user/franconnect-s3-user`:** `sam deploy` ran as your user rather than the deployer role. Check that both profiles from step 2 exist, that `shipperhq-deployer` uses `source_profile = shipperhq-deploy-profile`, and that `aws sts get-caller-identity --profile shipperhq-deployer` shows the assumed role.

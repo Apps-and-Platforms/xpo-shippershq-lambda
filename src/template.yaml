@@ -116,19 +116,86 @@ Resources:
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref BigCommerceOrderSyncSecret
+      Events:
+        OrderChangeQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BigCommerceOrderChangeQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # EventBridge's own RetryPolicy caps out at 185 attempts / 24h with exponential backoff, so
+  # retries are driven by SQS instead: a failed message reappears after the visibility timeout
+  # (5 minutes) and moves to the DLQ after 500 receives.
+  BigCommerceOrderChangeQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Buffers BigCommerce events between EventBridge and the order change function so failed events are retried every 5 minutes."
+        must:
+          - "VisibilityTimeout (retry interval) is 300 seconds and must stay >= the function Timeout."
+          - "RedrivePolicy maxReceiveCount is 500 before a message moves to BigCommerceOrderChangeDLQ."
+          - "MessageRetentionPeriod must exceed 500 x 300s (~41.7h) so messages are not dropped before reaching the DLQ."
+    Properties:
+      QueueName: !Sub "${BrandName}-bigcommerce-order-change"
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BigCommerceOrderChangeDLQ.Arn
+        maxReceiveCount: 500
+      Tags:
+        - Key: Brand
+          Value: !Ref BrandName
+
+  BigCommerceOrderChangeDLQ:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: "Holds BigCommerce events that failed 500 processing attempts, or that EventBridge could not deliver to BigCommerceOrderChangeQueue."
+    Properties:
+      QueueName: !Sub "${BrandName}-bigcommerce-order-change-dlq"
+      # Standard queue retention counts from the original enqueue time, so keep the maximum (14 days).
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Brand
+          Value: !Ref BrandName
+
+  BigCommerceOrderChangeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref BigCommerceOrderChangeQueue
+        - !Ref BigCommerceOrderChangeDLQ
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOrderChangeRuleSend
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource:
+              - !GetAtt BigCommerceOrderChangeQueue.Arn
+              - !GetAtt BigCommerceOrderChangeDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt BigCommerceOrderChangeRule.Arn
 
   BigCommerceOrderChangeRule:
     Type: AWS::Events::Rule
     Metadata:
       com.aws.cloudformation.Context:
-        why: "Forwards every event on the BigCommerce partner event bus to the order change function."
+        why: "Forwards every event on the BigCommerce partner event bus to the order change queue."
         trust:
           src: infer
           conf: low
           note: "rationale not documented"
     Properties:
       Name: !Sub "${BrandName}-bigcommerce-order-change-all"
-      Description: !Sub "Forwards all ${BrandName} BigCommerce events to the order change function."
+      Description: !Sub "Forwards all ${BrandName} BigCommerce events to the order change queue."
       EventBusName: !Ref BigCommerceEventBusName
       State: ENABLED
       # Empty prefix matches every event on the bus, forwarding all messages to the function.
@@ -136,16 +203,11 @@ Resources:
         source:
           - prefix: ""
       Targets:
-        - Id: BigCommerceOrderChangeFunctionV1
-          Arn: !GetAtt BigCommerceOrderChangeFunctionV1.Arn
-
-  BigCommerceOrderChangeRulePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref BigCommerceOrderChangeFunctionV1
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt BigCommerceOrderChangeRule.Arn
+        - Id: BigCommerceOrderChangeQueue
+          Arn: !GetAtt BigCommerceOrderChangeQueue.Arn
+          # Events EventBridge cannot deliver to the queue go straight to the DLQ.
+          DeadLetterConfig:
+            Arn: !GetAtt BigCommerceOrderChangeDLQ.Arn
 
 Outputs:
   BigCommerceOrderChangeFunctionV1:
@@ -163,6 +225,12 @@ Outputs:
     Value: !GetAtt BigCommerceOrderChangeRule.Arn
     Export:
       Name: !Sub "${BrandName}-BigCommerceOrderChangeRuleArn"
+  BigCommerceOrderChangeQueueUrl:
+    Description: "SQS queue that buffers BigCommerce events and retries failures every 5 minutes"
+    Value: !Ref BigCommerceOrderChangeQueue
+  BigCommerceOrderChangeDLQUrl:
+    Description: "Dead letter queue for BigCommerce events that failed 500 attempts or could not be delivered"
+    Value: !Ref BigCommerceOrderChangeDLQ
   BigCommerceOrderSyncSecretArn:
     Description: "Secrets Manager secret holding order sync credentials"
     Value: !Ref BigCommerceOrderSyncSecret

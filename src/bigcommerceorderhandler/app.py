@@ -47,6 +47,23 @@ def _load_credentials():
 
 
 def lambda_handler(event, context):
+    # EventBridge events arrive wrapped in SQS records; failed records are reported back so SQS
+    # retries them after the visibility timeout. A bare EventBridge event (sam local invoke) is
+    # processed directly.
+    if "Records" not in event:
+        return _process_event(event)
+
+    failures = []
+    for record in event["Records"]:
+        try:
+            _process_event(json.loads(record["body"]))
+        except Exception:
+            logger.exception("Failed to process SQS message %s", record.get("messageId"))
+            failures.append({"itemIdentifier": record["messageId"]})
+    return {"batchItemFailures": failures}
+
+
+def _process_event(event):
     logger.info("Received EventBridge event: %s", json.dumps(event, separators=(",", ":")))
     try:
         raw_order_id = event["detail"]["data"]["id"]
