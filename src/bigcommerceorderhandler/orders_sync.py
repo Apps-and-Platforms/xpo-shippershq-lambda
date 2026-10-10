@@ -16,7 +16,7 @@ import requests
 from dotenv import load_dotenv
 
 from logger import AppLogger
-from pipe17 import REVIEW_REQUIRED, Pipe17Client
+from pipe17 import PENDING_STATUSES, REVIEW_REQUIRED, Pipe17Client
 from shipperhq import ShipperHQClient, find_shipment_by_detail_name, get_carrier_code, map_to_wwex
 
 load_dotenv()
@@ -203,9 +203,21 @@ def process_order(order_id: int):
             raise RuntimeError(f"Order #{order_id} | no Pipe17 order found (modified={date_modified})")
 
         # Only orders that are awaiting review in Pipe17 get their carrier custom fields updated.
-        if not pipe17_client.is_order_status(pipe17_order_id, REVIEW_REQUIRED):
-            log.info(f"Order #{order_id} | Pipe17 order {pipe17_order_id} is not '{REVIEW_REQUIRED}'; skipping.")
-            return {"status": "not_review_required", "order_id": order_id}
+        # Orders still in an earlier status are retried until they reach review; anything else is final.
+        pipe17_status = pipe17_client.get_order_status(pipe17_order_id)
+        if pipe17_status is None:
+            raise TransientProcessingError(f"Order #{order_id} | could not read Pipe17 order {pipe17_order_id} status")
+        if pipe17_status in PENDING_STATUSES:
+            log.info(
+                f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', "
+                f"not yet '{REVIEW_REQUIRED}'; retrying later."
+            )
+            raise TransientProcessingError(
+                f"Order #{order_id} | Pipe17 order {pipe17_order_id} still '{pipe17_status}'"
+            )
+        if pipe17_status != REVIEW_REQUIRED:
+            log.info(f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', not '{REVIEW_REQUIRED}'; skipping.")
+            return {"status": "not_review_required", "order_id": order_id, "pipe17_status": pipe17_status}
 
         try:
             shipments = shq_client.get_advanced_shipment(order_id)
@@ -245,6 +257,8 @@ def process_order(order_id: int):
     except requests.exceptions.HTTPError as exc:
         log.critical(f"Aborting order sync due to unrecoverable API error: {exc}")
         raise exc
+    except TransientProcessingError:
+        raise
     except Exception as exc:
         log.critical(f"Unexpected error during order sync ({type(exc).__name__}): {exc}", exc_info=True)
         raise

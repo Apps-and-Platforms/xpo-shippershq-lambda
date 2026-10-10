@@ -1,2 +1,9 @@
 2026-10-08 12:18:53 | WARNING  | shipperhq | shipperhq.py:map_to_wwex:296 | No WWEX mapping for carrierCode='shqworldwideexpress' methodCode='XYZ'
 2026-10-08 12:21:02 | WARNING  | shipperhq | shipperhq.py:map_to_wwex:242 | No WWEX mapping for carrierCode='other' (expected 'shqworldwideexpress')
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:211 | Order #1 | Pipe17 order P1 is 'draft', not yet 'reviewRequired'; retrying later.
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:211 | Order #1 | Pipe17 order P1 is 'new', not yet 'reviewRequired'; retrying later.
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:211 | Order #1 | Pipe17 order P1 is 'onHold', not yet 'reviewRequired'; retrying later.
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:211 | Order #1 | Pipe17 order P1 is 'toBeValidated', not yet 'reviewRequired'; retrying later.
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:227 | Order #1 | ShipperHQ advanced shipment: []
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:232 | Order #1 | no 'World Wide Express 3PL' shipment in ShipperHQ; nothing to update in Pipe17.
+2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:219 | Order #1 | Pipe17 order P1 is 'readyForFulfillment', not 'reviewRequired'; skipping.

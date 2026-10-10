@@ -21,7 +21,16 @@ log = AppLogger(__name__)
 PIPE17_API_BASE_DEFAULT = "https://api-v3.pipe17.com/api/v3"
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
-REVIEW_REQUIRED = "reviewRequired"
+
+# Pipe17 order statuses that come before fulfillment.
+DRAFT = "draft"                       # incomplete; needs more data before processing
+NEW = "new"                           # initial status when the order is created in Pipe17
+ON_HOLD = "onHold"                    # temporarily paused (default 10 minutes)
+TO_BE_VALIDATED = "toBeValidated"     # awaiting validation
+REVIEW_REQUIRED = "reviewRequired"    # awaiting manual review; this is where we set the carrier
+
+# Statuses that are expected to move on to REVIEW_REQUIRED, so the event should be retried later.
+PENDING_STATUSES = frozenset({DRAFT, NEW, ON_HOLD, TO_BE_VALIDATED})
 
 
 class Pipe17Client:
@@ -174,6 +183,15 @@ class Pipe17Client:
             )
             return None
         return order
+
+    def get_order_status(self, order_id):
+        """Return the status of the Pipe17 order `order_id` (e.g. "reviewRequired"), or None if it can't be read."""
+        order = self.get_order(order_id)
+        if not order:
+            return None
+        status = order.get("status")
+        log.info(f"Pipe17 order {order_id} | status='{status}'")
+        return status
 
     def is_order_status(self, order_id, expected_status=REVIEW_REQUIRED):
         """Return True if the Pipe17 order `order_id` has status `expected_status` (e.g. "readyForFulfillment")."""
