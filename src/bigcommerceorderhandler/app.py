@@ -55,6 +55,12 @@ def lambda_handler(event, context):
 
     failures = []
     for record in event["Records"]:
+        receive_count = int(record['attributes']['ApproximateReceiveCount'])
+        if receive_count > 1:
+            # This message has failed previously and is being retried
+            logger.info(f"Retried message. Total attempts: {receive_count}")
+        else:
+            logger.info(f"Processing message for the first time.")
         try:
             _process_event(json.loads(record["body"]))
         except Exception:

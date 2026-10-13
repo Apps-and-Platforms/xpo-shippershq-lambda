@@ -22,11 +22,32 @@ MAX_RETRIES = 3
 
 SHQ_API_BASE_DEFAULT = "https://ovs.shipperhq.com"
 
-# ShipperHQ carrierCode -> carrier reported to Pipe17. Matched exactly; unlisted carriers are not synced.
-WWEX_CARRIER_MAP = {
+# ShipperHQ carrierCode -> carrier written to BigCommerce. Matched exactly.
+# Unlisted carriers raise UnknownCarrierError when mapping the WWEX metafields.
+CARRIER_CODE_MAP = {
     "shqworldwideexpress": "UPS",
     "shqworldwideexpressfreight": "LTL",
 }
+
+
+class CarrierMappingError(Exception):
+    """Raised when a ShipperHQ carrier/method cannot be mapped to a WWEX carrier/code."""
+
+
+class UnknownCarrierError(CarrierMappingError):
+    """Raised when a ShipperHQ carrierCode has no entry in CARRIER_CODE_MAP."""
+
+
+class MissingMethodCodeError(CarrierMappingError):
+    """Raised when a mapped ShipperHQ carrier has no methodCode."""
+
+
+class MissingCarrierMethodsError(CarrierMappingError):
+    """Raised when a ShipperHQ carrier has no methods."""
+
+
+class MissingCarriersError(CarrierMappingError):
+    """Raised when a ShipperHQ shipment has no carriers."""
 
 ADVANCED_SHIPMENT_QUERY = """
 query Order($orderNumber: String!) {
@@ -206,15 +227,25 @@ def get_carrier_codes(shipment: dict) -> list:
     return codes
 
 
+def _first_method_details(carrier: dict) -> dict:
+    """Return the methodDetails of the carrier's first method, or {} if it has none."""
+    methods = carrier.get("methods") or []
+    method_details = (methods[0].get("methodDetails") if methods else None) or {}
+    if isinstance(method_details, list):
+        method_details = method_details[0] if method_details else {}
+    return method_details
+
+
 def get_carrier_code(shipment: dict):
     """Return (carrierCode, methodCode) for the first carrier on `shipment` and its first method.
 
-    Either value is None if the shipment has no carriers, or the first carrier has no methods.
+    Raises MissingCarriersError if the shipment has no carriers, MissingCarrierMethodsError if the first
+    carrier has no methods.
     """
     carriers = (shipment or {}).get("carriers") or []
     if not carriers:
         log.warning(f"Shipment id={(shipment or {}).get('id')} has no carriers; cannot determine carrier/method code")
-        return None, None
+        raise MissingCarriersError(f"Shipment id={(shipment or {}).get('id')} has no carriers")
 
     if len(carriers) > 1:
         log.debug(f"Shipment id={shipment.get('id')} has {len(carriers)} carriers; using the first one")
@@ -223,13 +254,12 @@ def get_carrier_code(shipment: dict):
     carrier_code = (carrier.get("carrierDetail") or {}).get("carrierCode")
 
     methods = carrier.get("methods") or []
-    method_details = (methods[0].get("methodDetails") if methods else None) or {}
-    if isinstance(method_details, list):
-        method_details = method_details[0] if method_details else {}
+    method_details = _first_method_details(carrier)
     method_code = method_details.get("methodCode")
 
     if not methods:
         log.warning(f"Shipment id={shipment.get('id')} carrier '{carrier_code}' has no methods")
+        raise MissingCarrierMethodsError(f"Shipment id={shipment.get('id')} carrier '{carrier_code}' has no methods")
     log.debug(
         f"Shipment id={shipment.get('id')} resolved carrierCode='{carrier_code}' methodCode='{method_code}' "
         f"(methodTitle='{method_details.get('methodTitle')}')"
@@ -238,17 +268,47 @@ def get_carrier_code(shipment: dict):
 
 
 def map_to_wwex(carrier_code, method_code):
-    """Return (wwex_carrier, wwex_carrier_code) for a ShipperHQ carrier/method, or (None, None) if unmapped."""
-    wwex_carrier = WWEX_CARRIER_MAP.get(carrier_code)
+    """Return (wwex_carrier, wwex_carrier_code) for a ShipperHQ carrier/method.
+
+    Raises UnknownCarrierError if the carrierCode is unmapped, MissingMethodCodeError if the methodCode is missing.
+    """
+    wwex_carrier = CARRIER_CODE_MAP.get(carrier_code)
     if wwex_carrier is None:
-        log.warning(f"No WWEX mapping for carrierCode='{carrier_code}' (known: {list(WWEX_CARRIER_MAP)})")
-        return None, None
+        raise UnknownCarrierError(
+            f"No WWEX mapping for carrierCode='{carrier_code}' (known: {list(CARRIER_CODE_MAP)})"
+        )
     if not method_code:
-        log.warning(f"No methodCode for carrierCode='{carrier_code}'")
-        return None, None
+        raise MissingMethodCodeError(f"No methodCode for carrierCode='{carrier_code}'")
 
     log.debug(
         f"Mapped ShipperHQ carrierCode='{carrier_code}' methodCode='{method_code}' "
         f"-> WWEX carrier='{wwex_carrier}' code='{method_code}'"
     )
     return wwex_carrier, method_code
+
+
+def get_item_carriers(shipments: list) -> dict:
+    """Return {sku: (carrierTitle, methodCode of the carrier's first method)} for every item in every shipment's carriers."""
+    item_carriers = {}
+    for shipment in shipments or []:
+        for carrier in shipment.get("carriers") or []:
+            detail = carrier.get("carrierDetail") or {}
+            method_code = _first_method_details(carrier).get("methodCode")
+            if not method_code:
+                log.warning(f"Shipment id={shipment.get('id')} carrier '{detail.get('carrierCode')}' has no methodCode")
+            carrier_info = (map_to_wwex(detail.get("carrierCode"), method_code)[0], method_code)
+            for package in carrier.get("packages") or []:
+                for item in package.get("items") or []:
+                    sku = item.get("sku")
+                    if not sku:
+                        log.warning(f"Shipment id={shipment.get('id')} has an item with no sku; skipping it")
+                        continue
+                    if sku in item_carriers and item_carriers[sku] != carrier_info:
+                        log.warning(
+                            f"SKU '{sku}' appears under carriers {item_carriers[sku]} and {carrier_info}; "
+                            f"using the latter"
+                        )
+                    item_carriers[sku] = carrier_info
+
+    log.debug(f"Resolved carriers for {len(item_carriers)} SKU(s): {item_carriers}")
+    return item_carriers

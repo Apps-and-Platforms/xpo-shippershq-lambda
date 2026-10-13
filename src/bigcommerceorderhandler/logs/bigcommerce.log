@@ -7,3 +7,4 @@
 2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:227 | Order #1 | ShipperHQ advanced shipment: []
 2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:232 | Order #1 | no 'World Wide Express 3PL' shipment in ShipperHQ; nothing to update in Pipe17.
 2026-10-09 18:09:49 | INFO     | - | orders_sync | orders_sync.py:process_order:219 | Order #1 | Pipe17 order P1 is 'readyForFulfillment', not 'reviewRequired'; skipping.
+2026-10-13 13:06:52 | WARNING  | - | shipperhq | shipperhq.py:map_to_wwex:245 | No WWEX mapping for carrierCode='fedex' (known: ['shqworldwideexpress', 'shqworldwideexpressfreight'])
