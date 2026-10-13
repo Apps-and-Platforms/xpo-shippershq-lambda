@@ -128,6 +128,8 @@ If this returns `AccessDenied` on `sts:AssumeRole`, check that `TrustedPrincipal
 
 ## Step 3: Build
 
+Run the unit tests first (see [TESTING.md](TESTING.md)).
+
 ```bash
 sam build                    # or: sam build --use-container
 ```

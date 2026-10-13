@@ -1,0 +1,5 @@
+# Local development and unit tests. The Lambda itself only needs src/bigcommerceorderhandler/requirements.txt
+# (boto3 is provided by the Lambda runtime).
+-r src/bigcommerceorderhandler/requirements.txt
+boto3
+pytest
