@@ -13,3 +13,4 @@ src/tests/integration/__init__.py
 src/tests
 src/__pycache__/
 src/events/
+src/logs
