@@ -53,7 +53,7 @@ def set_wwex_metafields(client, order_id: int, wwex_carrier: str, wwex_carrier_c
     upsert_order_metafields(client, order_id, {
         "wwex_carrier": wwex_carrier,
         "wwex_carrier_code": wwex_carrier_code,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # "timestamp": datetime.now(timezone.utc).isoformat(),
         "actor": ACTOR,
     })
     log.info(
@@ -71,6 +71,6 @@ def set_item_carrier_metafields(client, order_id: int, item_carriers: dict) -> N
     values = {}
     for sku, (carrier_name, carrier_code) in item_carriers.items():
         values[f"carrier_{sku}"] = carrier_name
-        values[f"carrierode_{sku}"] = carrier_code
+        values[f"carrier_code_{sku}"] = carrier_code
     upsert_order_metafields(client, order_id, values)
     log.info(f"Order #{order_id} | BigCommerce per-SKU carrier metafields set for {len(item_carriers)} SKU(s): {item_carriers}")
