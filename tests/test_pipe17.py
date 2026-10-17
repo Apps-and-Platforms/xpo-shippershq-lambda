@@ -1,4 +1,4 @@
-"""Pipe17 is no longer called by process_order, but the client is kept for possible future use."""
+"""Tests for the Pipe17 client used by process_order."""
 
 import pytest
 import requests
@@ -99,19 +99,80 @@ class TestOrderStatus:
         assert REVIEW_REQUIRED not in PENDING_STATUSES
 
 
-class TestUpdateCustomFields:
-    def test_sends_custom_fields_and_status(self, mock_session_request):
-        mock_session_request.return_value = make_response(json_body={"success": True})
-        assert Pipe17Client().update_order_custom_fields("p1", "UPS", "GND") is True
+ITEM_CARRIERS = {
+    "SKU1": {
+        "carrier_code": "shqworldwideexpress",
+        "wwex_carrier": "UPS",
+        "method_code": "GND",
+        "carrier_title": "Title",
+        "method_title": "Method",
+    },
+    "SKU2": {
+        "carrier_code": "shqworldwideexpressfreight",
+        "wwex_carrier": "LTL",
+        "method_code": "LTL1",
+        "carrier_title": "Title",
+        "method_title": "Method",
+    },
+}
 
-        assert mock_session_request.call_args.args == ("PUT", f"{API}/orders/p1")
-        body = mock_session_request.call_args.kwargs["json"]
-        fields = {f["name"]: f["value"] for f in body["customFields"]}
-        assert fields["Carrier"] == "UPS"
-        assert fields["Code"] == "GND"
-        assert fields["Modified_By"] == "AWS_Lambda"
-        assert fields["Timestamp"].endswith("UTC")
+
+def put_body(mock_session_request):
+    put = [c for c in mock_session_request.call_args_list if c.args[0] == "PUT"]
+    assert len(put) == 1
+    assert put[0].args == ("PUT", f"{API}/orders/p1")
+    return put[0].kwargs["json"]
+
+
+class TestUpdateCustomFields:
+    def test_sets_carrier_fields_per_sku_in_one_put(self, mock_session_request):
+        mock_session_request.return_value = make_response(json_body={"success": True})
+        assert Pipe17Client().update_order_custom_fields("p1", ITEM_CARRIERS) is True
+
+        assert put_body(mock_session_request) == {
+            "customFields": [
+                {"name": "carrier_SKU1", "value": "UPS"},
+                {"name": "carrier_codeSKU1", "value": "GND"},
+                {"name": "carrier_SKU2", "value": "LTL"},
+                {"name": "carrier_codeSKU2", "value": "LTL1"},
+                {"name": "actor", "value": "aws_lambda"},
+            ],
+            "status": "readyForFulfillment",
+        }
+        # Only the PUT is sent; the order is not fetched first.
+        assert mock_session_request.call_count == 1
+
+    def test_missing_values_sent_as_empty_strings(self, mock_session_request):
+        mock_session_request.return_value = make_response(json_body={"success": True})
+        assert Pipe17Client().update_order_custom_fields(
+            "p1", {"SKU1": {"wwex_carrier": "UPS", "method_code": None}}
+        ) is True
+
+        assert put_body(mock_session_request)["customFields"] == [
+            {"name": "carrier_SKU1", "value": "UPS"},
+            {"name": "carrier_codeSKU1", "value": ""},
+            {"name": "actor", "value": "aws_lambda"},
+        ]
+
+    def test_sets_order_fields_alongside_sku_fields(self, mock_session_request):
+        mock_session_request.return_value = make_response(json_body={"success": True})
+        order_fields = {"order_wwex_carrier": "UPS", "order_wwex_code": "GND"}
+        assert Pipe17Client().update_order_custom_fields("p1", ITEM_CARRIERS, order_fields) is True
+
+        body = put_body(mock_session_request)
+        assert body["customFields"][-2:] == [
+            {"name": "order_wwex_carrier", "value": "UPS"},
+            {"name": "order_wwex_code", "value": "GND"},
+        ]
+        assert len(body["customFields"]) == 7
         assert body["status"] == "readyForFulfillment"
+
+    @pytest.mark.parametrize("item_carriers", [None, {}])
+    def test_no_item_carriers_fails_without_request(self, mock_session_request, item_carriers):
+        assert Pipe17Client().update_order_custom_fields(
+            "p1", item_carriers, {"order_wwex_carrier": "UPS"}
+        ) is False
+        mock_session_request.assert_not_called()
 
     @pytest.mark.parametrize(
         "response,expected",
@@ -123,4 +184,4 @@ class TestUpdateCustomFields:
     )
     def test_result(self, mock_session_request, response, expected):
         mock_session_request.return_value = response
-        assert Pipe17Client().update_order_custom_fields("p1", "UPS", "GND") is expected
+        assert Pipe17Client().update_order_custom_fields("p1", ITEM_CARRIERS) is expected

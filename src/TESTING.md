@@ -47,8 +47,7 @@ Open the Testing panel (beaker icon), choose **Configure Python Tests**, then pi
 | [`tests/test_app.py`](../tests/test_app.py) | `app.py`: loading the Secrets Manager secret, checking the order ID, reporting failed SQS records for retry |
 | [`tests/test_orders_sync.py`](../tests/test_orders_sync.py) | `orders_sync.py`: BigCommerce client retries and errors, every result of `process_order` |
 | [`tests/test_shipperhq.py`](../tests/test_shipperhq.py) | `shipperhq.py`: GraphQL client, shipment and carrier helpers, WWEX mapping |
-| [`tests/test_bigcommerce_metafields.py`](../tests/test_bigcommerce_metafields.py) | `bigcommerce_metafields.py`: creating and updating order metafields |
-| [`tests/test_pipe17.py`](../tests/test_pipe17.py) | `pipe17.py`: Pipe17 client (no longer called, but kept) |
+| [`tests/test_pipe17.py`](../tests/test_pipe17.py) | `pipe17.py`: Pipe17 client, order lookup, status checks, carrier custom fields |
 | [`tests/test_logger.py`](../tests/test_logger.py) | `logger.py`: handlers, levels, local log file |
 
 ## How the tests stay offline

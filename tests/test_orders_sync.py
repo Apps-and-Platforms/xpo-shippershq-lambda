@@ -3,10 +3,10 @@ from unittest import mock
 import pytest
 import requests
 
+import bigcommerce_metafields
 import orders_sync
 from conftest import make_response
 from orders_sync import (
-    AWAITING_SHIPMENT_STATUS_ID,
     BigCommerceClient,
     TransientProcessingError,
     log_order,
@@ -106,8 +106,8 @@ class TestOrderEndpoints:
         assert mock_session_request.call_args.args == ("GET", ORDER_URL)
 
     def test_update_order_status(self, mock_session_request):
-        mock_session_request.return_value = make_response(json_body={"id": 42, "status": "Awaiting Shipment"})
-        assert BigCommerceClient().update_order_status(42, 9)["status"] == "Awaiting Shipment"
+        mock_session_request.return_value = make_response(json_body={"id": 42, "status": "Awaiting Fulfillment"})
+        assert BigCommerceClient().update_order_status(42, 9)["status"] == "Awaiting Fulfillment"
         assert mock_session_request.call_args.args == ("PUT", ORDER_URL)
         assert mock_session_request.call_args.kwargs["json"] == {"status_id": 9}
 
@@ -145,6 +145,14 @@ WWEX_SHIPMENTS = [
     }
 ]
 
+SKU1_CARRIER = {
+    "carrier_code": "shqworldwideexpress",
+    "wwex_carrier": "UPS",
+    "method_code": "GND",
+    "carrier_title": None,
+    "method_title": None,
+}
+
 
 @pytest.fixture
 def bc_client(monkeypatch):
@@ -152,6 +160,13 @@ def bc_client(monkeypatch):
     client.get_order.return_value = {"id": 42, "status": "Awaiting Fulfillment"}
     monkeypatch.setattr(orders_sync, "BigCommerceClient", mock.Mock(return_value=client))
     return client
+
+
+@pytest.fixture(autouse=True)
+def upsert_metafield(monkeypatch):
+    upsert = mock.Mock()
+    monkeypatch.setattr(bigcommerce_metafields, "upsert_order_metafield", upsert)
+    return upsert
 
 
 @pytest.fixture
@@ -163,21 +178,30 @@ def shq_client(monkeypatch):
 
 
 @pytest.fixture
-def metafields(monkeypatch):
-    fakes = mock.Mock()
-    monkeypatch.setattr(orders_sync, "set_item_carrier_metafields", fakes.set_item_carrier_metafields)
-    monkeypatch.setattr(orders_sync, "set_wwex_metafields", fakes.set_wwex_metafields)
-    return fakes
+def pipe17_client(monkeypatch):
+    client = mock.Mock()
+    client.get_order_id_by_ext_order_id.return_value = "p1"
+    client.get_order_status.return_value = orders_sync.REVIEW_REQUIRED
+    client.update_order_custom_fields.return_value = True
+    monkeypatch.setattr(orders_sync, "Pipe17Client", mock.Mock(return_value=client))
+    return client
 
 
 class TestProcessOrder:
-    def test_happy_path_sets_metafields_and_status(self, bc_client, shq_client, metafields):
+    def test_happy_path_sets_pipe17_fields_without_status_change(
+        self, bc_client, shq_client, pipe17_client, upsert_metafield
+    ):
         assert process_order(42) == {"status": "updated", "order_id": 42}
+        assert upsert_metafield.call_args_list == [
+            mock.call(bc_client, 42, "pipe17_update_status", "processing"),
+            mock.call(bc_client, 42, "pipe17_update_status", "updated"),
+        ]
 
         shq_client.get_advanced_shipment.assert_called_once_with(42)
-        metafields.set_item_carrier_metafields.assert_called_once_with(bc_client, 42, {"SKU1": ("UPS", "GND")})
-        metafields.set_wwex_metafields.assert_called_once_with(bc_client, 42, "UPS", "GND")
-        bc_client.update_order_status.assert_called_once_with(42, AWAITING_SHIPMENT_STATUS_ID)
+        pipe17_client.update_order_custom_fields.assert_called_once_with(
+            "p1", {"SKU1": SKU1_CARRIER}, {"order_wwex_carrier": "UPS", "order_wwex_code": "GND"}
+        )
+        bc_client.update_order_status.assert_not_called()
 
     def test_bigcommerce_client_init_failure_raises(self, monkeypatch):
         monkeypatch.setattr(orders_sync, "BigCommerceClient", mock.Mock(side_effect=ValueError("no creds")))
@@ -196,26 +220,26 @@ class TestProcessOrder:
         with pytest.raises(TransientProcessingError):
             process_order(42)
 
-    def test_shipperhq_http_error_returns_failed(self, bc_client, shq_client, metafields):
+    def test_shipperhq_http_error_returns_failed(self, bc_client, shq_client, pipe17_client):
         shq_client.get_advanced_shipment.side_effect = requests.exceptions.HTTPError("500")
         assert process_order(42) == {"status": "failed", "order_id": 42}
         bc_client.update_order_status.assert_not_called()
 
-    def test_no_wwex_shipment_still_sets_item_metafields_and_status(self, bc_client, shq_client, metafields):
+    def test_shipment_name_does_not_matter(self, bc_client, shq_client, pipe17_client):
         other = [dict(WWEX_SHIPMENTS[0], shipmentDetail={"name": "Warehouse"})]
         shq_client.get_advanced_shipment.return_value = other
 
         assert process_order(42) == {"status": "updated", "order_id": 42}
-        metafields.set_item_carrier_metafields.assert_called_once()
-        metafields.set_wwex_metafields.assert_not_called()
-        bc_client.update_order_status.assert_called_once_with(42, AWAITING_SHIPMENT_STATUS_ID)
+        pipe17_client.update_order_custom_fields.assert_called_once_with(
+            "p1", {"SKU1": SKU1_CARRIER}, {"order_wwex_carrier": "UPS", "order_wwex_code": "GND"}
+        )
 
-    def test_no_shipments_still_updates_status(self, bc_client, shq_client, metafields):
+    def test_no_shipments_still_updates_status(self, bc_client, shq_client, pipe17_client):
         shq_client.get_advanced_shipment.return_value = None
         assert process_order(42)["status"] == "updated"
-        metafields.set_item_carrier_metafields.assert_called_once_with(bc_client, 42, {})
+        pipe17_client.update_order_custom_fields.assert_called_once_with("p1", {}, {})
 
-    def test_unmapped_carrier_returns_unmapped_without_status_change(self, bc_client, shq_client, metafields):
+    def test_unmapped_carrier_returns_unmapped_without_status_change(self, bc_client, shq_client, pipe17_client):
         shipments = [dict(WWEX_SHIPMENTS[0])]
         shipments[0]["carriers"] = [dict(WWEX_SHIPMENTS[0]["carriers"][0], carrierDetail={"carrierCode": "fedex"})]
         shq_client.get_advanced_shipment.return_value = shipments
@@ -225,22 +249,37 @@ class TestProcessOrder:
         assert "fedex" in result["error"]
         bc_client.update_order_status.assert_not_called()
 
-    def test_wwex_shipment_without_carriers_returns_unmapped(self, bc_client, shq_client, metafields):
-        shq_client.get_advanced_shipment.return_value = [dict(WWEX_SHIPMENTS[0], carriers=[])]
+    def test_carrier_without_method_code_returns_unmapped(self, bc_client, shq_client, pipe17_client):
+        carrier = dict(WWEX_SHIPMENTS[0]["carriers"][0], methods=[])
+        shq_client.get_advanced_shipment.return_value = [dict(WWEX_SHIPMENTS[0], carriers=[carrier])]
         assert process_order(42)["status"] == "unmapped"
-        metafields.set_wwex_metafields.assert_not_called()
+        pipe17_client.update_order_custom_fields.assert_not_called()
 
-    def test_bigcommerce_http_error_during_sync_raises(self, bc_client, shq_client, metafields):
-        metafields.set_item_carrier_metafields.side_effect = requests.exceptions.HTTPError("422")
+    def test_pipe17_lookup_http_error_raises(self, bc_client, shq_client, pipe17_client):
+        pipe17_client.get_order_id_by_ext_order_id.side_effect = requests.exceptions.HTTPError("500")
         with pytest.raises(requests.exceptions.HTTPError):
             process_order(42)
 
-    def test_status_update_failure_raises(self, bc_client, shq_client, metafields):
-        bc_client.update_order_status.side_effect = requests.exceptions.HTTPError("500")
-        with pytest.raises(requests.exceptions.HTTPError):
-            process_order(42)
+    def test_pipe17_update_failure_returns_failed_without_status_change(
+        self, bc_client, shq_client, pipe17_client, upsert_metafield
+    ):
+        pipe17_client.update_order_custom_fields.return_value = False
+        assert process_order(42) == {"status": "failed", "order_id": 42}
+        assert upsert_metafield.call_args_list[-1] == mock.call(bc_client, 42, "pipe17_update_status", "failed")
+        bc_client.update_order_status.assert_not_called()
 
-    def test_unexpected_error_raises(self, bc_client, shq_client, metafields):
-        metafields.set_wwex_metafields.side_effect = KeyError("boom")
+    def test_metafield_error_is_logged_not_raised(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        upsert_metafield.side_effect = requests.exceptions.HTTPError("500")
+        assert process_order(42)["status"] == "updated"
+
+    def test_only_processing_written_when_pipe17_not_review_required(
+        self, bc_client, shq_client, pipe17_client, upsert_metafield
+    ):
+        pipe17_client.get_order_status.return_value = "readyForFulfillment"
+        assert process_order(42)["status"] == "not_review_required"
+        upsert_metafield.assert_called_once_with(bc_client, 42, "pipe17_update_status", "processing")
+
+    def test_unexpected_error_raises(self, bc_client, shq_client, pipe17_client):
+        pipe17_client.update_order_custom_fields.side_effect = KeyError("boom")
         with pytest.raises(KeyError):
             process_order(42)

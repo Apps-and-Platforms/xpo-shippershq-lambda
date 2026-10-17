@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv
 
+from bigcommerce_metafields import record_pipe17_status
 from logger import AppLogger
 from pipe17 import PENDING_STATUSES, REVIEW_REQUIRED, Pipe17Client
 from shipperhq import ShipperHQClient, CarrierMappingError, get_item_carriers, get_order_wwex_fields
@@ -212,6 +213,8 @@ def process_order(order_id: int):
                 log.error(f"Order #{order_id} | no Pipe17 order found (modified={date_modified}); skipping.")
             raise RuntimeError(f"Order #{order_id} | no Pipe17 order found (modified={date_modified})")
 
+        record_pipe17_status(client, order_id, "processing")
+
         # Only orders that are awaiting review in Pipe17 get their carrier custom fields updated.
         # Orders still in an earlier status are retried until they reach review; anything else is final.
         pipe17_status = pipe17_client.get_order_status(pipe17_order_id)
@@ -242,6 +245,7 @@ def process_order(order_id: int):
         log.info(f"Order #{order_id} | order WWEX fields: {order_fields}")
 
         updated = pipe17_client.update_order_custom_fields(pipe17_order_id, item_carriers, order_fields)
+        record_pipe17_status(client, order_id, "updated" if updated else "failed")
         if not updated:
             log.error(f"Order #{order_id} | Pipe17 update failed.")
             return {"status": "failed", "order_id": order_id}

@@ -14,6 +14,7 @@ from shipperhq import (
     get_carrier_code,
     get_carrier_codes,
     get_item_carriers,
+    get_order_wwex_fields,
     map_to_wwex,
 )
 
@@ -28,6 +29,16 @@ def carrier(code, method_code="GND", skus=(), title="Carrier"):
 
 def shipment(name, *carriers, shipment_id="s1"):
     return {"id": shipment_id, "shipmentDetail": {"name": name}, "carriers": list(carriers)}
+
+
+def item_info(carrier_code, wwex_carrier, method_code, carrier_title="Carrier", method_title="Method"):
+    return {
+        "carrier_code": carrier_code,
+        "wwex_carrier": wwex_carrier,
+        "method_code": method_code,
+        "carrier_title": carrier_title,
+        "method_title": method_title,
+    }
 
 
 # --- ShipperHQClient -------------------------------------------------------------------------------
@@ -200,9 +211,9 @@ class TestGetItemCarriers:
             shipment("b", carrier("shqworldwideexpressfreight", "LTL1", skus=["SKU3"])),
         ]
         assert get_item_carriers(shipments) == {
-            "SKU1": ("UPS", "GND"),
-            "SKU2": ("UPS", "GND"),
-            "SKU3": ("LTL", "LTL1"),
+            "SKU1": item_info("shqworldwideexpress", "UPS", "GND"),
+            "SKU2": item_info("shqworldwideexpress", "UPS", "GND"),
+            "SKU3": item_info("shqworldwideexpressfreight", "LTL", "LTL1"),
         }
 
     def test_later_carrier_wins_for_duplicate_sku(self):
@@ -210,12 +221,12 @@ class TestGetItemCarriers:
             shipment("a", carrier("shqworldwideexpress", "GND", skus=["SKU1"])),
             shipment("b", carrier("shqworldwideexpressfreight", "LTL1", skus=["SKU1"])),
         ]
-        assert get_item_carriers(shipments) == {"SKU1": ("LTL", "LTL1")}
+        assert get_item_carriers(shipments) == {"SKU1": item_info("shqworldwideexpressfreight", "LTL", "LTL1")}
 
     def test_skips_items_without_sku(self):
         c = carrier("shqworldwideexpress", "GND", skus=["SKU1"])
         c["packages"][0]["items"].append({"qtyPacked": 1})
-        assert get_item_carriers([shipment("a", c)]) == {"SKU1": ("UPS", "GND")}
+        assert get_item_carriers([shipment("a", c)]) == {"SKU1": item_info("shqworldwideexpress", "UPS", "GND")}
 
     @pytest.mark.parametrize("shipments", [None, [], [shipment("a")]])
     def test_empty(self, shipments):
@@ -228,3 +239,20 @@ class TestGetItemCarriers:
     def test_missing_method_code_raises(self):
         with pytest.raises(MissingMethodCodeError):
             get_item_carriers([shipment("a", carrier("shqworldwideexpress", method_code=None, skus=["SKU1"]))])
+
+
+class TestGetOrderWwexFields:
+    def test_uses_first_wwex_item(self):
+        item_carriers = {
+            "SKU1": {"carrier_code": "other", "method_code": "X"},
+            "SKU2": {"carrier_code": "shqworldwideexpressfreight", "method_code": "LTL1"},
+            "SKU3": {"carrier_code": "shqworldwideexpress", "method_code": "GND"},
+        }
+        assert get_order_wwex_fields(item_carriers) == {
+            "order_wwex_carrier": "LTL",
+            "order_wwex_code": "LTL1",
+        }
+
+    @pytest.mark.parametrize("item_carriers", [None, {}, {"SKU1": {"carrier_code": "other", "method_code": "X"}}])
+    def test_no_wwex_item(self, item_carriers):
+        assert get_order_wwex_fields(item_carriers) == {}

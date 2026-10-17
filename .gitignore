@@ -15,3 +15,5 @@ src/__pycache__/
 src/events/
 src/logs
 tests/_pycache_
+logs/bigcommerce.log
+tests/__pycache__/
