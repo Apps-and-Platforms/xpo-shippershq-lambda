@@ -272,12 +272,50 @@ class TestProcessOrder:
         upsert_metafield.side_effect = requests.exceptions.HTTPError("500")
         assert process_order(42)["status"] == "updated"
 
-    def test_only_processing_written_when_pipe17_not_review_required(
+    def test_no_metafield_written_when_pipe17_not_review_required(
         self, bc_client, shq_client, pipe17_client, upsert_metafield
     ):
         pipe17_client.get_order_status.return_value = "readyForFulfillment"
         assert process_order(42)["status"] == "not_review_required"
-        upsert_metafield.assert_called_once_with(bc_client, 42, "pipe17_update_status", "processing")
+        upsert_metafield.assert_not_called()
+
+    def test_no_metafield_written_when_pipe17_pending(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        pipe17_client.get_order_status.return_value = next(iter(orders_sync.PENDING_STATUSES))
+        with pytest.raises(TransientProcessingError):
+            process_order(42)
+        upsert_metafield.assert_not_called()
+
+    def test_shipperhq_http_error_records_failed(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        shq_client.get_advanced_shipment.side_effect = requests.exceptions.HTTPError("500")
+        assert process_order(42)["status"] == "failed"
+        assert upsert_metafield.call_args_list == [
+            mock.call(bc_client, 42, "pipe17_update_status", "processing"),
+            mock.call(bc_client, 42, "pipe17_update_status", "failed"),
+        ]
+
+    def test_unmapped_carrier_records_failed(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        carrier = dict(WWEX_SHIPMENTS[0]["carriers"][0], methods=[])
+        shq_client.get_advanced_shipment.return_value = [dict(WWEX_SHIPMENTS[0], carriers=[carrier])]
+        assert process_order(42)["status"] == "unmapped"
+        assert upsert_metafield.call_args_list[-1] == mock.call(bc_client, 42, "pipe17_update_status", "failed")
+
+    def test_pipe17_update_http_error_records_failed(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        pipe17_client.update_order_custom_fields.side_effect = requests.exceptions.HTTPError("500")
+        with pytest.raises(requests.exceptions.HTTPError):
+            process_order(42)
+        assert upsert_metafield.call_args_list[-1] == mock.call(bc_client, 42, "pipe17_update_status", "failed")
+
+    def test_unexpected_error_records_failed(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        pipe17_client.update_order_custom_fields.side_effect = KeyError("boom")
+        with pytest.raises(KeyError):
+            process_order(42)
+        assert upsert_metafield.call_args_list[-1] == mock.call(bc_client, 42, "pipe17_update_status", "failed")
+
+    def test_pipe17_lookup_error_writes_no_metafield(self, bc_client, shq_client, pipe17_client, upsert_metafield):
+        pipe17_client.get_order_id_by_ext_order_id.side_effect = requests.exceptions.HTTPError("500")
+        with pytest.raises(requests.exceptions.HTTPError):
+            process_order(42)
+        upsert_metafield.assert_not_called()
 
     def test_unexpected_error_raises(self, bc_client, shq_client, pipe17_client):
         pipe17_client.update_order_custom_fields.side_effect = KeyError("boom")

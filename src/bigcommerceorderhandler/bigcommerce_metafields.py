@@ -18,6 +18,9 @@ METAFIELD_NAMESPACE = "shippingdetails"
 METAFIELD_PERMISSION_SET = "read"
 # Metafield recording the progress of the Pipe17 carrier update ("processing" / "updated" / "failed").
 PIPE17_STATUS_METAFIELD_KEY = "pipe17_update_status"
+PIPE17_STATUS_PROCESSING = "processing"
+PIPE17_STATUS_UPDATED = "updated"
+PIPE17_STATUS_FAILED = "failed"
 
 
 def upsert_order_metafield(client, order_id: int, key: str, value):

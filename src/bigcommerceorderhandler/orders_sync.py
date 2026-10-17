@@ -15,7 +15,12 @@ from datetime import datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv
 
-from bigcommerce_metafields import record_pipe17_status
+from bigcommerce_metafields import (
+    PIPE17_STATUS_FAILED,
+    PIPE17_STATUS_PROCESSING,
+    PIPE17_STATUS_UPDATED,
+    record_pipe17_status,
+)
 from logger import AppLogger
 from pipe17 import PENDING_STATUSES, REVIEW_REQUIRED, Pipe17Client
 from shipperhq import ShipperHQClient, CarrierMappingError, get_item_carriers, get_order_wwex_fields
@@ -192,7 +197,14 @@ def process_order(order_id: int):
     except ValueError as exc:
         log.critical(f"Could not initialize API clients: {exc}. Exiting.")
         raise TransientProcessingError(f"Could not initialize API clients: {exc}")
- 
+
+    # Set once "processing" is recorded, so every exit after that records a final "updated"/"failed".
+    processing_recorded = False
+
+    def record_failed():
+        if processing_recorded:
+            record_pipe17_status(client, order_id, PIPE17_STATUS_FAILED)
+
     try:
         try:
             pipe17_order_id = pipe17_client.get_order_id_by_ext_order_id(ext_order_id=order_id)
@@ -213,8 +225,6 @@ def process_order(order_id: int):
                 log.error(f"Order #{order_id} | no Pipe17 order found (modified={date_modified}); skipping.")
             raise RuntimeError(f"Order #{order_id} | no Pipe17 order found (modified={date_modified})")
 
-        record_pipe17_status(client, order_id, "processing")
-
         # Only orders that are awaiting review in Pipe17 get their carrier custom fields updated.
         # Orders still in an earlier status are retried until they reach review; anything else is final.
         pipe17_status = pipe17_client.get_order_status(pipe17_order_id)
@@ -232,10 +242,14 @@ def process_order(order_id: int):
             log.info(f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', not '{REVIEW_REQUIRED}'; skipping.")
             return {"status": "not_review_required", "order_id": order_id, "pipe17_status": pipe17_status}
 
+        record_pipe17_status(client, order_id, PIPE17_STATUS_PROCESSING)
+        processing_recorded = True
+
         try:
             shipments = shq_client.get_advanced_shipment(order_id)
         except requests.exceptions.HTTPError as exc:
             log.error(f"Failed to fetch ShipperHQ advanced shipment for order #{order_id}: {exc}")
+            record_failed()
             return {"status": "failed", "order_id": order_id}
         log.info(f"Order #{order_id} | ShipperHQ advanced shipment: {shipments}")
 
@@ -245,7 +259,7 @@ def process_order(order_id: int):
         log.info(f"Order #{order_id} | order WWEX fields: {order_fields}")
 
         updated = pipe17_client.update_order_custom_fields(pipe17_order_id, item_carriers, order_fields)
-        record_pipe17_status(client, order_id, "updated" if updated else "failed")
+        record_pipe17_status(client, order_id, PIPE17_STATUS_UPDATED if updated else PIPE17_STATUS_FAILED)
         if not updated:
             log.error(f"Order #{order_id} | Pipe17 update failed.")
             return {"status": "failed", "order_id": order_id}
@@ -254,15 +268,18 @@ def process_order(order_id: int):
 
     except requests.exceptions.HTTPError as exc:
         log.critical(f"Aborting order sync due to unrecoverable API error: {exc}")
+        record_failed()
         raise exc
     except TransientProcessingError:
         raise
     except CarrierMappingError as exc:
         # Retrying won't fix bad ShipperHQ carrier data, so fail without retrying the SQS message.
         log.error(f"Order #{order_id} | carrier mapping failed ({type(exc).__name__}); not retrying: {exc}")
+        record_failed()
         return {"status": "unmapped", "order_id": order_id, "error": str(exc)}
     except Exception as exc:
         log.critical(f"Unexpected error during order sync ({type(exc).__name__}): {exc}", exc_info=True)
+        record_failed()
         raise
 
     log.info(f"Order #{order_id} | sync complete.")
