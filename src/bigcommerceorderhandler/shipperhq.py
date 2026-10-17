@@ -23,11 +23,15 @@ MAX_RETRIES = 3
 SHQ_API_BASE_DEFAULT = "https://ovs.shipperhq.com"
 
 # ShipperHQ carrierCode -> carrier written to BigCommerce. Matched exactly.
-# Unlisted carriers raise UnknownCarrierError when mapping the WWEX metafields.
+# Unlisted carriers raise UnknownCarrierError when mapping the WWEX carrier.
 CARRIER_CODE_MAP = {
     "shqworldwideexpress": "UPS",
     "shqworldwideexpressfreight": "LTL",
 }
+
+
+# ShipperHQ carrierCodes that ship through WWEX; the first item using one sets the order-level WWEX fields.
+WWEX_CARRIER_CODES = ("shqworldwideexpress", "shqworldwideexpressfreight")
 
 
 class CarrierMappingError(Exception):
@@ -288,15 +292,35 @@ def map_to_wwex(carrier_code, method_code):
 
 
 def get_item_carriers(shipments: list) -> dict:
-    """Return {sku: (carrierTitle, methodCode of the carrier's first method)} for every item in every shipment's carriers."""
+    """Return the carrier details for every item in every shipment's carriers, keyed by SKU.
+
+    Each value is a dict:
+        carrier_code  - ShipperHQ carrierCode
+        wwex_carrier  - carrierCode mapped through map_to_wwex (e.g. "UPS", "LTL")
+        method_code   - methodCode of the carrier's first method
+        carrier_title - ShipperHQ carrierTitle
+        method_title  - methodTitle of the carrier's first method
+
+    Raises CarrierMappingError (via map_to_wwex) if a carrier can't be mapped to WWEX.
+    """
     item_carriers = {}
     for shipment in shipments or []:
         for carrier in shipment.get("carriers") or []:
             detail = carrier.get("carrierDetail") or {}
-            method_code = _first_method_details(carrier).get("methodCode")
+            method_details = _first_method_details(carrier)
+            carrier_code = detail.get("carrierCode")
+            method_code = method_details.get("methodCode")
             if not method_code:
-                log.warning(f"Shipment id={shipment.get('id')} carrier '{detail.get('carrierCode')}' has no methodCode")
-            carrier_info = (map_to_wwex(detail.get("carrierCode"), method_code)[0], method_code)
+                log.warning(f"Shipment id={shipment.get('id')} carrier '{carrier_code}' has no methodCode")
+            wwex_carrier, _ = map_to_wwex(carrier_code, method_code)
+
+            carrier_info = {
+                "carrier_code": carrier_code,
+                "wwex_carrier": wwex_carrier,
+                "method_code": method_code,
+                "carrier_title": detail.get("carrierTitle"),
+                "method_title": method_details.get("methodTitle"),
+            }
             for package in carrier.get("packages") or []:
                 for item in package.get("items") or []:
                     sku = item.get("sku")
@@ -312,3 +336,19 @@ def get_item_carriers(shipments: list) -> dict:
 
     log.debug(f"Resolved carriers for {len(item_carriers)} SKU(s): {item_carriers}")
     return item_carriers
+
+
+def get_order_wwex_fields(item_carriers: dict) -> dict:
+    """Return the order-level WWEX fields from the first item whose carrier_code is a WWEX carrier.
+
+    Returns {"order_wwex_carrier": <item carrier_code mapped through CARRIER_CODE_MAP, e.g. "UPS">,
+    "order_wwex_code": <item method_code>}, or {} if no item ships with a WWEX carrier.
+    """
+    for sku, info in (item_carriers or {}).items():
+        carrier_code = info.get("carrier_code")
+        if carrier_code in WWEX_CARRIER_CODES:
+            log.debug(f"Using SKU '{sku}' for order WWEX fields: {info}")
+            return {"order_wwex_carrier": CARRIER_CODE_MAP[carrier_code], "order_wwex_code": info.get("method_code")}
+
+    log.info(f"No item with a WWEX carrier {WWEX_CARRIER_CODES}; no order WWEX fields")
+    return {}

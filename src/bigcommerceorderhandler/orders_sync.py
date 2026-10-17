@@ -15,17 +15,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv
 
-from bigcommerce_metafields import set_item_carrier_metafields, set_wwex_metafields
 from logger import AppLogger
 from pipe17 import PENDING_STATUSES, REVIEW_REQUIRED, Pipe17Client
-from shipperhq import (
-    ShipperHQClient,
-    find_shipment_by_detail_name,
-    get_carrier_code,
-    CarrierMappingError,
-    get_item_carriers,
-    map_to_wwex,
-)
+from shipperhq import ShipperHQClient, CarrierMappingError, get_item_carriers, get_order_wwex_fields
 
 load_dotenv()
 
@@ -195,47 +187,47 @@ def process_order(order_id: int):
 
     try:
         shq_client = ShipperHQClient()
-        # pipe17_client = Pipe17Client()
+        pipe17_client = Pipe17Client()
     except ValueError as exc:
         log.critical(f"Could not initialize API clients: {exc}. Exiting.")
         raise TransientProcessingError(f"Could not initialize API clients: {exc}")
-
+ 
     try:
-        # try:
-        #     pipe17_order_id = pipe17_client.get_order_id_by_ext_order_id(ext_order_id=order_id)
-        # except requests.exceptions.HTTPError as exc:
-        #     log.critical(f"Order #{order_id} | failed to look up Pipe17 order: {exc}")
-        #     raise exc
+        try:
+            pipe17_order_id = pipe17_client.get_order_id_by_ext_order_id(ext_order_id=order_id)
+        except requests.exceptions.HTTPError as exc:
+            log.critical(f"Order #{order_id} | failed to look up Pipe17 order: {exc}")
+            raise exc
 
-        # if pipe17_order_id is None:
-        #     # Pipe17 may lag behind BigCommerce; only escalate once the order has been missing a while.
-        #     date_modified = order.get("date_modified")
-        #     try:
-        #         order_age = datetime.now(timezone.utc) - parsedate_to_datetime(date_modified)
-        #     except (TypeError, ValueError):
-        #         order_age = None
-        #     if order_age is not None and order_age < PIPE17_MISSING_GRACE_PERIOD:
-        #         log.warning(f"Order #{order_id} | no Pipe17 order found yet (modified={date_modified}); skipping.")
-        #     else:
-        #         log.error(f"Order #{order_id} | no Pipe17 order found (modified={date_modified}); skipping.")
-        #     raise RuntimeError(f"Order #{order_id} | no Pipe17 order found (modified={date_modified})")
+        if pipe17_order_id is None:
+            # Pipe17 may lag behind BigCommerce; only escalate once the order has been missing a while.
+            date_modified = order.get("date_modified")
+            try:
+                order_age = datetime.now(timezone.utc) - parsedate_to_datetime(date_modified)
+            except (TypeError, ValueError):
+                order_age = None
+            if order_age is not None and order_age < PIPE17_MISSING_GRACE_PERIOD:
+                log.warning(f"Order #{order_id} | no Pipe17 order found yet (modified={date_modified}); skipping.")
+            else:
+                log.error(f"Order #{order_id} | no Pipe17 order found (modified={date_modified}); skipping.")
+            raise RuntimeError(f"Order #{order_id} | no Pipe17 order found (modified={date_modified})")
 
-        # # Only orders that are awaiting review in Pipe17 get their carrier custom fields updated.
-        # # Orders still in an earlier status are retried until they reach review; anything else is final.
-        # pipe17_status = pipe17_client.get_order_status(pipe17_order_id)
-        # if pipe17_status is None:
-        #     raise TransientProcessingError(f"Order #{order_id} | could not read Pipe17 order {pipe17_order_id} status")
-        # if pipe17_status in PENDING_STATUSES:
-        #     log.info(
-        #         f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', "
-        #         f"not yet '{REVIEW_REQUIRED}'; retrying later."
-        #     )
-        #     raise TransientProcessingError(
-        #         f"Order #{order_id} | Pipe17 order {pipe17_order_id} still '{pipe17_status}'"
-        #     )
-        # if pipe17_status != REVIEW_REQUIRED:
-        #     log.info(f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', not '{REVIEW_REQUIRED}'; skipping.")
-        #     return {"status": "not_review_required", "order_id": order_id, "pipe17_status": pipe17_status}
+        # Only orders that are awaiting review in Pipe17 get their carrier custom fields updated.
+        # Orders still in an earlier status are retried until they reach review; anything else is final.
+        pipe17_status = pipe17_client.get_order_status(pipe17_order_id)
+        if pipe17_status is None:
+            raise TransientProcessingError(f"Order #{order_id} | could not read Pipe17 order {pipe17_order_id} status")
+        if pipe17_status in PENDING_STATUSES:
+            log.info(
+                f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', "
+                f"not yet '{REVIEW_REQUIRED}'; retrying later."
+            )
+            raise TransientProcessingError(
+                f"Order #{order_id} | Pipe17 order {pipe17_order_id} still '{pipe17_status}'"
+            )
+        if pipe17_status != REVIEW_REQUIRED:
+            log.info(f"Order #{order_id} | Pipe17 order {pipe17_order_id} is '{pipe17_status}', not '{REVIEW_REQUIRED}'; skipping.")
+            return {"status": "not_review_required", "order_id": order_id, "pipe17_status": pipe17_status}
 
         try:
             shipments = shq_client.get_advanced_shipment(order_id)
@@ -244,38 +236,17 @@ def process_order(order_id: int):
             return {"status": "failed", "order_id": order_id}
         log.info(f"Order #{order_id} | ShipperHQ advanced shipment: {shipments}")
 
-        set_item_carrier_metafields(client, order_id, get_item_carriers(shipments))
+        item_carriers = get_item_carriers(shipments)
+        log.info(f"Order #{order_id} | carriers by SKU: {item_carriers}")
+        order_fields = get_order_wwex_fields(item_carriers)
+        log.info(f"Order #{order_id} | order WWEX fields: {order_fields}")
 
-        # There should be only one shipment with wwex in order
-        wwex_shipment = find_shipment_by_detail_name(shipments=shipments, name="World Wide Express 3PL")
-        if wwex_shipment is not None:
-            carrier_code, method_code = get_carrier_code(shipment=wwex_shipment)
-            log.info(f"Order #{order_id} | Carrier Code: {carrier_code} Method Code: {method_code}")
-    
-            wwex_carrier, wwex_carrier_code = map_to_wwex(carrier_code, method_code)
-    
-            log.info(
-                f"Order #{order_id} | mapped {carrier_code}/{method_code} "
-                f"-> Carrier='{wwex_carrier}' Code='{wwex_carrier_code}'"
-            )
-            set_wwex_metafields(client, order_id, wwex_carrier, wwex_carrier_code)
-        else:
-            log.info(
-                f"Order #{order_id} | no 'World Wide Express 3PL' shipment in ShipperHQ; "
-                f"nothing to update in Pipe17."
-            )
+        updated = pipe17_client.update_order_custom_fields(pipe17_order_id, item_carriers, order_fields)
+        if not updated:
+            log.error(f"Order #{order_id} | Pipe17 update failed.")
+            return {"status": "failed", "order_id": order_id}
 
-        client.update_order_status(order_id, AWAITING_SHIPMENT_STATUS_ID)
-
-
-        
-        # Commented as we are no longer calling pipe17 due to design change
-        # updated = pipe17_client.update_order_custom_fields(
-        #     pipe17_order_id, carrier=wwex_carrier, carrier_code=wwex_carrier_code
-        # )
-        # if not updated:
-        #     log.error(f"Order #{order_id} | Pipe17 update failed.")
-        #     return {"status": "failed", "order_id": order_id}
+        # client.update_order_status(order_id, AWAITING_SHIPMENT_STATUS_ID)
 
     except requests.exceptions.HTTPError as exc:
         log.critical(f"Aborting order sync due to unrecoverable API error: {exc}")

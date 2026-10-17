@@ -7,7 +7,6 @@ Credentials are read from environment variables (see .env.example):
 
 import os
 import time
-from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -21,6 +20,8 @@ log = AppLogger(__name__)
 PIPE17_API_BASE_DEFAULT = "https://api-v3.pipe17.com/api/v3"
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
+# Recorded in the "actor" custom field so it's clear which system set the carrier.
+ACTOR = "aws_lambda"
 
 # Pipe17 order statuses that come before fulfillment.
 DRAFT = "draft"                       # incomplete; needs more data before processing
@@ -206,35 +207,52 @@ class Pipe17Client:
         )
         return matches
 
-    def update_order_custom_fields(self, order_id, carrier, carrier_code):
-        """Set the "Carrier", "Code" and "Timestamp" custom fields on the Pipe17 order with internal id `order_id`.
+    def update_order_custom_fields(self, order_id, item_carriers, order_fields=None):
+        """Set carrier custom fields on the Pipe17 order `order_id` in a single PUT.
 
-        Returns True if Pipe17 reports the update succeeded, False otherwise.
+        `item_carriers` is {sku: carrier details} from shipperhq.get_item_carriers. Each SKU becomes two
+        order custom fields: "<sku>_carrier" (its wwex_carrier) and "<sku>_carrier_code" (its method_code),
+        plus a single "actor" field, and the order is moved to readyForFulfillment.
+
+        `order_fields` ({name: value}, e.g. order_wwex_carrier / order_wwex_code) are also set as custom
+        fields on the order.
+
+        Returns True if Pipe17 reports the update succeeded, False otherwise (including when
+        `item_carriers` is empty).
         """
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        body = {
-            "customFields": [
-                {"name": "Carrier", "value": carrier},
-                {"name": "Code", "value": carrier_code},
-                {"name": "Timestamp", "value": timestamp},
-                {"name": "Modified_By", "value": "AWS_Lambda"},
-            ],
-            "status":"readyForFulfillment"
-        }
-        log.info(f"Pipe17 order {order_id} | updating customFields Carrier='{carrier}' Code='{carrier_code}' Timestamp='{timestamp}'")
+        if not item_carriers:
+            log.error(f"Pipe17 order {order_id} | no item carriers; carrier custom fields not set")
+            return False
+
+        fields = {}
+        for sku, info in item_carriers.items():
+            fields[f"carrier_{sku}"] = info.get("wwex_carrier")
+            fields[f"carrier_code{sku}"] = info.get("method_code")
+        fields["actor"] = ACTOR
+        fields.update(order_fields or {})
+
+        body = {"customFields": _custom_fields(fields), "status": "readyForFulfillment"}
+
+        log.info(f"Pipe17 order {order_id} | updating order customFields {fields}")
         try:
             payload = self._request(f"orders/{order_id}", method="PUT", json_body=body)
         except requests.exceptions.RequestException as exc:
-            log.error(f"Pipe17 order {order_id} | failed to update customFields: {type(exc).__name__}: {exc}")
+            log.error(f"Pipe17 order {order_id} | failed to update carrier fields: {type(exc).__name__}: {exc}")
             return False
 
         # An empty body (e.g. 204) means the PUT was accepted; otherwise trust the "success" flag.
         success = payload.get("success", True) is True
         if success:
-            log.info(f"Pipe17 order {order_id} | updated customFields Carrier='{carrier}' Code='{carrier_code}' Timestamp='{timestamp}'")
+            log.info(f"Pipe17 order {order_id} | updated carrier fields")
         else:
             log.error(
-                f"Pipe17 order {order_id} | customFields update rejected: "
+                f"Pipe17 order {order_id} | carrier fields update rejected: "
                 f"code={payload.get('code')} message='{payload.get('message')}'"
             )
         return success
+
+
+def _custom_fields(values):
+    """Turn {name: value} into Pipe17's [{"name", "value"}] list; values are sent as strings."""
+    return [{"name": name, "value": "" if value is None else str(value)} for name, value in values.items()]
+
