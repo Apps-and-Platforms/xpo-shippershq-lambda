@@ -5,3 +5,5 @@ you also need aws sam
 
 brew tap aws/tap
 brew install aws-sam-cli
+
+test
