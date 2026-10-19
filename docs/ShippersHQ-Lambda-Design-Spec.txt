@@ -1,0 +1,168 @@
+ShippersHQ Lambda — Design Spec
+
+Oct 19, 2026 · Jayesh Rege
+
+Overview
+
+The service copies the carrier and shipping method that ShipperHQ picked for each item of a BigCommerce order onto the matching Pipe17 order, then releases that order to fulfillment. It runs as one Python 3.14 Lambda per brand (the first deploy is clubpilates), deployed with AWS SAM.
+
+| System | Role | API used |
+| BigCommerce | Source of order events; stores the sync outcome on the order | REST v2 Orders, v3 Order Metafields, EventBridge partner bus |
+| ShipperHQ | Source of the chosen carrier, method and packed SKUs per shipment | GraphQL viewOrder (scope LIVE) |
+| Pipe17 | Target: receives carrier custom fields and the readyForFulfillment status | REST v3 orders |
+
+In scope: orders with BigCommerce status Awaiting Fulfillment whose Pipe17 order is in reviewRequired, shipped through Worldwide Express (WWEX) parcel or freight.
+
+Out of scope: changing the BigCommerce order status (removed in the latest commit), carriers other than the two WWEX codes, and any write back to ShipperHQ.
+
+Architecture
+
+One SAM stack per brand holds an EventBridge rule, an SQS queue with a DLQ, the Lambda and its secret; the Lambda is the only component with business logic.
+
+  +-------------------+    +----------------------+    +--------------------+    +-------------------+
+  | BigCommerce store | -> | EventBridge rule     | -> | SQS queue          | -> | Lambda function   |
+  | order events on   |    | forwards every event |    | retry every 60 s   |    | Python 3.14, 30 s |
+  | partner event bus |    | (empty source prefix)|    | 4-day retention    |    | batch size 1      |
+  +-------------------+    +----------------------+    +--------------------+    +-------------------+
+                                     |                           |                         |
+                                     | undeliverable             | after 500 receives      | per message
+                                     |                           v                         |
+                                     |                 +--------------------+              |
+                                     +---------------> | Dead-letter queue  |              |
+                                                       | kept 14 days       |              |
+                                                       +--------------------+              |
+                                                                                           |
+        +-----------------------+-----------------------+-----------------------+---------+-------------+
+        v                       v                       v                       v                       v
+  +-----------------+   +---------------------+   +-------------------+   +-------------------+   +-----------------+
+  | Secrets Manager |   | BigCommerce API     |   | ShipperHQ API     |   | Pipe17 API        |   | CloudWatch Logs |
+  | API credentials |   | read order (v2)     |   | GraphQL viewOrder |   | lookup + status   |   | stdout from     |
+  | loaded once     |   | write metafield (v3)|   | carriers per SKU  |   | PUT custom fields |   | AppLogger       |
+  +-----------------+   +---------------------+   +-------------------+   +-------------------+   +-----------------+
+
+Read left to right along the top for the event path, then down for the calls each message makes. Code lives in src/bigcommerceorderhandler/: app.py (SQS entry point, secret loading), orders_sync.py (orchestration, BigCommerce client), shipperhq.py, pipe17.py, bigcommerce_metafields.py and logger.py.
+
+Processing logic
+
+Each message is processed by process_order in orders_sync.py; every check either finishes the message, skips it, or raises so SQS redelivers it 60 s later. The shippingdetails.pipe17_update_status metafield on the BigCommerce order tracks progress once the order passes the Pipe17 status gate.
+
+| # | Step | If it fails or doesn't match | Retried? | Metafield |
+| 1 | Parse detail.data.id as a positive integer | ValueError | Yes (until DLQ) | none |
+| 2 | Load credentials from Secrets Manager (cached per container) | Error raised | Yes | none |
+| 3 | GET BigCommerce order; require status Awaiting Fulfillment | Returns skipped | No | none |
+| 4 | Find the Pipe17 order by extOrderId = BC order id | RuntimeError (warning if modified < 7 days ago, error after) | Yes | none |
+| 5 | Read Pipe17 status: draft, new, onHold, toBeValidated | TransientProcessingError | Yes | none |
+| 6 | Pipe17 status is anything other than reviewRequired | Returns not_review_required | No | none |
+| 7 | Record processing | Logged only, never raised | n/a | processing |
+| 8 | Query ShipperHQ viewOrder for shipments | HTTP error returns failed | No | failed |
+| 9 | Map each carrier to WWEX and index carriers by SKU | CarrierMappingError returns unmapped | No | failed |
+| 10 | PUT custom fields and status: readyForFulfillment to Pipe17 | Returns failed | No | failed |
+| 11 | Success | Returns updated | n/a | updated |
+
+Any other HTTP or unexpected error after step 7 records failed and re-raises, so SQS retries it. Updating the BigCommerce order to Awaiting Shipment (status id 9) is commented out by design.
+
+Integrations and data mapping
+
+Only two ShipperHQ carrier codes are mapped; any other carrier on the order fails the whole sync with UnknownCarrierError.
+
+| ShipperHQ carrierCode | WWEX carrier written | Code written |
+| shqworldwideexpress | UPS | the carrier's first methodCode |
+| shqworldwideexpressfreight | LTL | the carrier's first methodCode |
+
+Pipe17 custom fields are sent in one PUT to orders/{orderId} as a list of {name, value} strings:
+
+| Field | Value | Granularity |
+| carrier_<sku> | Mapped WWEX carrier (UPS / LTL) | per packed SKU |
+| carrier_code<sku> | ShipperHQ methodCode | per packed SKU |
+| order_wwex_carrier | WWEX carrier of the first SKU on a WWEX carrier | per order |
+| order_wwex_code | That SKU's methodCode | per order |
+| actor | aws_lambda | per order |
+
+The same PUT sets the Pipe17 order status to readyForFulfillment. SKUs come from carriers.packages.items.sku across every shipment; if one SKU appears under two carriers, the last one wins and a warning is logged.
+
+Order identity: the BigCommerce order id is used as the ShipperHQ orderNumber and as the Pipe17 extOrderId. If Pipe17 returns several orders for one extOrderId, the first is used.
+
+BigCommerce metafield: namespace shippingdetails, key pipe17_update_status, values processing / updated / failed, permission set read (other API accounts can read it; only this app writes it).
+
+HTTP clients: all three clients use requests sessions with a 30 s timeout and 3 attempts. Network errors back off 2 s then 4 s. A 429 waits for X-Rate-Limit-Time-Reset-Ms on BigCommerce and 2^attempt seconds on ShipperHQ and Pipe17.
+
+Configuration, deployment and security
+
+All credentials live in one Secrets Manager secret per brand, <BrandName>/shipperhq/bigcommerce-order-sync; the function gets only its ARN through ORDER_SYNC_SECRET_ARN.
+
+| Secret key | Required | Default |
+| BC_STORE_HASH | Yes | none |
+| BC_ACCESS_TOKEN | Yes | none |
+| PIPE17_API_KEY | Yes | none |
+| SHQ_ACCESS_TOKEN | Yes | none |
+| BC_CLIENT_ID | No | empty |
+| SHQ_API_BASE | No | https://ovs.shipperhq.com |
+| PIPE17_API_BASE | No | https://api-v3.pipe17.com/api/v3 |
+| LOG_LEVEL | No | INFO |
+
+The handler loads the secret on the first event per container, rejects it if a required key is empty, and copies only allow-listed keys into the environment. scripts/update_order_sync_secret.py rewrites the whole secret from a local .env (with --dry-run and masked output).
+
+Stack parameters (template.yaml): BrandName (prefixes every resource), BigCommerceEventBusName, SecretAdminPrincipalArn, PermissionsBoundaryPolicyName (default shipperhq-lambda-permissions-boundary). The deployed stack is clubpilates-shipperhq in us-east-2.
+
+Security controls:
+
+- The secret's resource policy denies GetSecretValue to everyone except the function role and the secret admin.
+- The function role is capped by a permissions boundary created by iam/sam-deployer-role.yaml.
+- Deploys run as the shipperhq-sam-deployer role, limited to stacks named *-shipperhq and resources prefixed by the brand pattern.
+- Both SQS queues use SSE; only the EventBridge rule may send to them.
+
+Deployment is two steps: an admin deploys the deployer role once per account and region, then sam build && sam deploy runs with the shipperhq-deployer profile (see src/DEPLOYMENT.md).
+
+Error handling and observability
+
+Retries are driven by SQS, not EventBridge: a failed message reappears after the 60 s visibility timeout and moves to the DLQ after 500 receives, about 8.3 hours of retrying.
+
+| Setting | Value |
+| Lambda timeout | 30 s |
+| SQS batch size | 1, with ReportBatchItemFailures |
+| Visibility timeout (retry interval) | 60 s |
+| maxReceiveCount | 500 |
+| Main queue retention | 4 days |
+| DLQ retention | 14 days |
+| EventBridge delivery failure | sent straight to the DLQ |
+
+Retry policy by error class:
+
+- Retried: Pipe17 order not found, Pipe17 still in a pending status, unreadable Pipe17 status, client init failures, BigCommerce/Pipe17 HTTP errors before the final update, and unexpected exceptions.
+- Not retried (terminal): BC order not Awaiting Fulfillment, Pipe17 past reviewRequired, carrier mapping errors, ShipperHQ HTTP errors, and a rejected Pipe17 update. These are visible only through logs and the failed metafield.
+- Metafield writes never raise, so a BigCommerce outage cannot undo a Pipe17 update that already landed.
+
+Logging: AppLogger writes to stdout (CloudWatch in Lambda) and a rotating 5 MB file when run locally. Each line carries timestamp, level, AWS request id, module, file:function:line and the message, prefixed Order #<id>. Statuses such as Cancelled or Refunded log at WARNING and Disputed at ERROR. Each SQS receive logs its attempt count.
+
+Tests: pytest suites in tests/ cover each module (test_app, test_orders_sync, test_pipe17, test_shipperhq, test_bigcommerce_metafields, test_logger); see src/TESTING.md.
+
+Decisions, known gaps and open questions
+
+The design settled on 2026-10-19: Pipe17 is the system of record for carrier data, and BigCommerce only receives a status metafield.
+
+| Date | Decision (from commit history) |
+| 2026-10-19 | Stop changing the BigCommerce order status |
+| 2026-10-16 | Write carrier custom fields to Pipe17 again; log each metafield update |
+| 2026-10-14 | Drop the timestamp field; rename key carriercode to carrier_code |
+| 2026-10-13 | Briefly moved to BC metafields + Awaiting Shipment instead of Pipe17 (since reversed) |
+| 2026-10-09 | Retry while Pipe17 is in any status before reviewRequired |
+| 2026-10-09 | Put SQS between EventBridge and Lambda for per-minute retries |
+| 2026-10-08 | Log to stdout so CloudWatch captures logs in Lambda |
+
+Known gaps found in review:
+
+1. Every bus event reaches the function. The rule's empty source prefix forwards all BigCommerce events. A non-order event with detail.data.id (a product or customer id) is fetched as an order, 404s, and retries 500 times before reaching the DLQ. Filter on order event types in the rule.
+2. Field names differ from the docstring. update_order_custom_fields documents <sku>_carrier and <sku>_carrier_code, but writes carrier_<sku> and carrier_code<sku> (no underscore before the SKU).
+3. Retries can outlast the Lambda timeout. One call can take up to 3 × 30 s plus backoff, against a 30 s function timeout. A timeout after processing is recorded leaves the metafield stuck at processing until the redelivery.
+4. get_advanced_shipment relies on assert. When ShipperHQ returns no viewOrder, len(None) raises TypeError; asserts are also stripped under python -O.
+5. Terminal failures raise no alert. Unmapped carriers, ShipperHQ errors and rejected Pipe17 updates end the message silently; nothing alarms on the DLQ depth or on failed metafields.
+6. The 7-day Pipe17 grace period never applies to new orders. Retries stop after about 8.3 hours, so the warning-vs-error switch only matters for orders modified long ago.
+7. Unused code remains: find_shipment_by_detail_name, get_carrier_code, is_order_status, update_order_status and AWAITING_SHIPMENT_STATUS_ID.
+8. The secret is deleted with the stack (DeletionPolicy: Delete), so credentials must be re-entered after a stack rebuild.
+
+Open questions:
+
+- [ ] Is carrier_code<sku> the field name Pipe17 or the warehouse expects, or should it be carrier_code_<sku>?
+- [ ] samconfig.toml deploys brand clubpilates against the BigCommerce_YogaSix_Sandbox_EventBridge bus. Is that the intended pairing?
+- [ ] Should terminal failures notify someone (SNS, alarm), or is the metafield enough?
+- [ ] Should orders with a mix of WWEX and other carriers be partially synced instead of failing entirely?
