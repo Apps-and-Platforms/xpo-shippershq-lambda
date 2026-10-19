@@ -264,6 +264,7 @@ def process_order(order_id: int):
             log.error(f"Order #{order_id} | Pipe17 update failed.")
             return {"status": "failed", "order_id": order_id}
 
+        # not updating the order status to AWAITING_SHIPMENT_STATUS_ID because it is not needed and can cause issues with some orders
         # client.update_order_status(order_id, AWAITING_SHIPMENT_STATUS_ID)
 
     except requests.exceptions.HTTPError as exc:
