@@ -1,4 +1,3 @@
-.vscode/
 src/credentials/
 
 
@@ -17,3 +16,8 @@ src/logs
 tests/_pycache_
 logs/bigcommerce.log
 tests/__pycache__/
+src/bigcommerceorderhandler/credentials
+src/bigcommerceorderhandler/logs
+
+
+
